@@ -10,6 +10,9 @@ env:
   IDEVICE_REF: 94bc9e8cf3b41f32f125f046abf33d913f4e1b2d
   IDEVICE_A_SIZE: "97089368"
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-26
@@ -78,6 +81,19 @@ jobs:
           name: MirageGo-ipa
           path: MirageGo.ipa
           if-no-files-found: error
+
+      # Public download without a GitHub login: the newest green build always lives at
+      # https://github.com/chromegt/mirage-go/releases/latest/download/MirageGo.ipa
+      - name: Publish to the "latest" release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Mirage Go (latest build)
+          body: "Newest green build of Mirage Go. Download MirageGo.ipa and install it with Sideloadly. Built from ${{ github.sha }} (run ${{ github.run_number }})."
+          files: MirageGo.ipa
+          prerelease: false
+          make_latest: true
 
       - name: Upload build log
         if: always()
