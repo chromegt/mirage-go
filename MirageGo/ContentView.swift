@@ -1148,6 +1148,7 @@ struct SettingsView: View {
                     Text("How the phone moves, and whether it is ready.").font(.footnote).foregroundStyle(Theme.muted)
                 }
                 .padding(.horizontal, 20).padding(.top, 24)   // clears the TopScrim so the title is never under it at rest
+                mapGroup
                 movement
                 phoneLink
                 advanced
@@ -1196,13 +1197,15 @@ struct SettingsView: View {
 
     // MARK: groups
 
-    var movement: some View {
+    var mapGroup: some View {
         group("Map") {
             toggleRow("Colour map", "Apple's satellite colours instead of the black & white world.", isOn: $settings.colourMap)
             sep
             toggleRow("Stars in space", "A starfield around the planet when you zoom all the way out.", isOn: $settings.stars)
         }
+    }
 
+    var movement: some View {
         group("Movement") {
             toggleRow("Realistic travel", "Glide to a new place at a real speed instead of jumping.", isOn: $settings.travel)
             speedChips
