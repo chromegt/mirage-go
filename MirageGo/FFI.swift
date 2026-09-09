@@ -10,17 +10,37 @@ enum FFIError: LocalizedError {
     case call(code: Int32, sub: Int32, message: String)
     case badAddress
     case noHandle(String)
+    /// pair-verify failed and idevice fell back to pair-setup (PIN "000000"): the phone no longer accepts this file.
+    case pairingRejected(String)
 
     var errorDescription: String? {
         switch self {
         case .call(let code, let sub, let message): return "\(message) (code \(code)/\(sub))"
         case .badAddress: return "Bad device address"
         case .noHandle(let what): return "\(what) was not created"
+        case .pairingRejected(let message): return "The phone rejected the pairing file (pair-setup was attempted): \(message)"
         }
     }
     var code: Int32 {
         if case .call(let c, _, _) = self { return c }
         return 0
+    }
+    var isPairingRejected: Bool {
+        if case .pairingRejected = self { return true }
+        return false
+    }
+}
+
+/// Diagnostics for the RPPairing PIN fallback. idevice only asks for a PIN when pair-verify rejected the file
+/// (RESEARCH.md 3.2 #8), so "the callback fired" == "the pairing file is stale". The FFI copies the returned
+/// string (CStr::from_ptr(...).to_string()) and never frees it, so one static buffer is enough.
+enum PairingDiag {
+    static var pinRequested = false
+    static let pin: UnsafeMutablePointer<CChar> = strdup("000000")!
+    static let pinCallback: @convention(c) (UnsafeMutableRawPointer?) -> UnsafePointer<CChar>? = { _ in
+        PairingDiag.pinRequested = true
+        AppLog.shared.add("pair-verify failed; the phone asked for a pairing PIN (pairing file is stale)")
+        return UnsafePointer(PairingDiag.pin)
     }
 }
 
@@ -65,12 +85,17 @@ final class DeviceTunnel {
         }
         var adapter: OpaquePointer?
         var handshake: OpaquePointer?
+        PairingDiag.pinRequested = false
         let err = withUnsafePointer(to: &addr) { p in
             p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                tunnel_create_rppairing(sa, socklen_t(MemoryLayout<sockaddr_in>.stride), hostname, pairing, nil, nil, &adapter, &handshake)
+                tunnel_create_rppairing(sa, socklen_t(MemoryLayout<sockaddr_in>.stride), hostname, pairing, PairingDiag.pinCallback, nil, &adapter, &handshake)
             }
         }
-        do { try ffiCheck(err) } catch { t.close(); throw error }
+        do { try ffiCheck(err) } catch {
+            t.close()
+            if PairingDiag.pinRequested { throw FFIError.pairingRejected(error.localizedDescription) }
+            throw error
+        }
         guard let adapter, let handshake else { t.close(); throw FFIError.noHandle("tunnel") }
         t.adapter = adapter
         t.handshake = handshake
@@ -158,19 +183,21 @@ enum DDIMounter {
         let tcData = try Data(contentsOf: trustCache)
         let bmData = try Data(contentsOf: manifest)
 
-        var lockdown: OpaquePointer?
-        try ffiCheck(lockdownd_connect_rsd(adapter, handshake, &lockdown))
-        guard let lockdown else { throw FFIError.noHandle("lockdownd") }
-        var ecid: UInt64 = 0
-        do {
+        // Scoped so the lockdown stream is freed (also on a throw) before the mount starts.
+        let ecid: UInt64 = try {
+            var lockdown: OpaquePointer?
+            try ffiCheck(lockdownd_connect_rsd(adapter, handshake, &lockdown))
+            guard let lockdown else { throw FFIError.noHandle("lockdownd") }
+            defer { lockdownd_client_free(lockdown) }
             var node: plist_t?
             try ffiCheck(lockdownd_get_value(lockdown, "UniqueChipID", nil, &node))
+            var value: UInt64 = 0
             if let node {
-                plist_get_uint_val(node, &ecid)
+                plist_get_uint_val(node, &value)
                 plist_free(node)
             }
-        }
-        lockdownd_client_free(lockdown)
+            return value
+        }()
         guard ecid != 0 else { throw FFIError.noHandle("UniqueChipID") }
 
         var client: OpaquePointer?

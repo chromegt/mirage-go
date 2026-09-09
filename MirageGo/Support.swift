@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 import UIKit
 import CoreLocation
 
@@ -36,39 +37,58 @@ enum PairingStore {
     static var url: URL { AppPaths.support.appendingPathComponent(fileName) }
 
     /// The app's Documents folder is visible in Finder/iTunes/Apple Devices file sharing and reachable over AFC,
-    /// so a file dropped there is adopted automatically.
+    /// so a file dropped there is adopted automatically. A Documents copy is adopted at most once: it is skipped
+    /// when it is byte-identical to the installed file, and it is renamed to `*.imported.plist` afterwards, so it
+    /// can never overwrite a file the user imported later through the picker.
     static func adoptFromDocuments() {
         let fm = FileManager.default
         let candidates = ["pairingFile.plist", "pairing.plist", "pairing_file.plist"]
             .map { AppPaths.documents.appendingPathComponent($0) }
             + ((try? fm.contentsOfDirectory(at: AppPaths.documents, includingPropertiesForKeys: nil)) ?? [])
                 .filter { $0.pathExtension == "mobiledevicepairing" || $0.pathExtension == "mobiledevicepair" }
+        let installed = try? Data(contentsOf: url)
         for c in candidates where fm.fileExists(atPath: c.path) {
-            if (try? install(from: c)) != nil {
+            if let installed, let candidate = try? Data(contentsOf: c), candidate == installed { continue }
+            do {
+                try install(from: c)
                 AppLog.shared.add("Adopted pairing file from Documents/\(c.lastPathComponent)")
+                let aside = c.deletingPathExtension().appendingPathExtension("imported.plist")
+                try? fm.removeItem(at: aside)
+                try? fm.moveItem(at: c, to: aside)
                 return
+            } catch {
+                AppLog.shared.add("Documents/\(c.lastPathComponent) not adopted: \(error.localizedDescription)")
             }
         }
     }
 
     static func install(from src: URL) throws {
         let data = try Data(contentsOf: src)
-        guard let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
-              plist["public_key"] != nil || plist["HostID"] != nil else {
+        guard let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else {
             throw NSError(domain: "MirageGo", code: 1, userInfo: [NSLocalizedDescriptionKey: "That file is not a pairing file."])
+        }
+        // Only a Remote pairing file (public_key/private_key/identifier) works over the loopback tunnel.
+        guard plist["public_key"] != nil else {
+            let msg = plist["HostID"] != nil
+                ? "That is a USB (lockdown) pairing file. In idevice_pair choose Remote pairing, then Save to file."
+                : "That file is not a pairing file."
+            throw NSError(domain: "MirageGo", code: 3, userInfo: [NSLocalizedDescriptionKey: msg])
         }
         try? FileManager.default.removeItem(at: url)
         try data.write(to: url, options: .atomic)
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
-    static var present: Bool { FileManager.default.fileExists(atPath: url.path) }
+    static let remoteKind = "remote pairing"
+
+    /// True only for a file the engine can actually use.
+    static var present: Bool { kind == remoteKind }
 
     static var kind: String {
         guard let data = try? Data(contentsOf: url),
               let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else { return "none" }
-        if plist["public_key"] != nil { return "remote pairing" }
-        if plist["HostID"] != nil { return "lockdown (not supported yet)" }
+        if plist["public_key"] != nil { return remoteKind }
+        if plist["HostID"] != nil { return "lockdown (not supported)" }
         return "unknown"
     }
 }
@@ -87,6 +107,13 @@ enum DDIStore {
         return fm.fileExists(atPath: image.path) && fm.fileExists(atPath: trustCache.path) && fm.fileExists(atPath: manifest.path)
     }
 
+    /// Deletes the three files so `download` fetches them again.
+    static func removeAll() {
+        for f in [image, trustCache, manifest] { try? FileManager.default.removeItem(at: f) }
+    }
+
+    /// Main-actor so `progress` may touch SwiftUI state directly; the URLSession await still runs off-main.
+    @MainActor
     static func download(progress: @escaping (String) -> Void) async throws {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         for (name, dest) in [("BuildManifest.plist", manifest), ("Image.dmg.trustcache", trustCache), ("Image.dmg", image)] {
@@ -107,6 +134,10 @@ enum DDIStore {
 // MARK: - LocalDev VPN
 
 enum VPNHelper {
+    static let storeURL = URL(string: "https://apps.apple.com/us/app/localdevvpn/id6755608044")!
+
+    static func openStore() { UIApplication.shared.open(storeURL) }
+
     static var installed: Bool {
         guard let u = URL(string: "localdevvpn://") else { return false }
         return UIApplication.shared.canOpenURL(u)
