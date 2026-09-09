@@ -5,3 +5,5 @@ DerivedData/
 .DS_Store
 *.plist.bak
 pairing/
+Vendor/idevice/libidevice_ffi.a
+ref/
