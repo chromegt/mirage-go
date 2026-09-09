@@ -86,6 +86,51 @@ struct GlassCircleButton: View {
 
 /// Top scrim for the scrolling tabs: solid under the status bar, a short fade below it, so scrolled rows never run
 /// under the clock. Overlay it on the ScrollView with `alignment: .top`.
+/// Stars around the planet while the stage is zoomed all the way out: the desktop app's space backdrop. Positions
+/// are deterministic, the brightest few twinkle slowly, and a radial mask keeps the centre (where the globe sits)
+/// clear so the stars only live in space. Drawn with plusLighter so they only ever add light.
+struct Starfield: View {
+    struct Star { let x: CGFloat; let y: CGFloat; let r: CGFloat; let a: Double }
+    static let stars: [Star] = {
+        var g = SeededRandom(seed: 0x5EED_1234)
+        return (0..<190).map { _ in
+            Star(x: CGFloat(g.next()), y: CGFloat(g.next()), r: CGFloat(0.45 + g.next() * 1.05), a: 0.22 + g.next() * 0.7)
+        }
+    }()
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: reduceMotion ? 3600 : 0.6)) { ctx in
+            let t = ctx.date.timeIntervalSinceReferenceDate
+            Canvas { g, size in
+                for (i, s) in Self.stars.enumerated() {
+                    let twinkle = (!reduceMotion && i % 7 == 0) ? 0.45 + 0.55 * abs(sin(t * 0.8 + Double(i))) : 1.0
+                    let p = CGPoint(x: s.x * size.width, y: s.y * size.height)
+                    g.fill(Path(ellipseIn: CGRect(x: p.x - s.r, y: p.y - s.r, width: s.r * 2, height: s.r * 2)),
+                           with: .color(.white.opacity(s.a * twinkle)))
+                    if s.r > 1.3 {   // a soft halo on the biggest ones
+                        g.fill(Path(ellipseIn: CGRect(x: p.x - s.r * 3, y: p.y - s.r * 3, width: s.r * 6, height: s.r * 6)),
+                               with: .color(.white.opacity(0.06 * twinkle)))
+                    }
+                }
+            }
+        }
+        .blendMode(.plusLighter)
+        .mask(RadialGradient(stops: [.init(color: .clear, location: 0), .init(color: .clear, location: 0.4), .init(color: .white, location: 0.68)],
+                             center: .center, startRadius: 0, endRadius: 300))
+        .allowsHitTesting(false)
+    }
+}
+
+/// Tiny LCG so the star layout is the same on every launch (no Foundation randomness in a view body).
+struct SeededRandom {
+    private var state: UInt64
+    init(seed: UInt64) { state = seed }
+    mutating func next() -> Double {
+        state = state &* 6364136223846793005 &+ 1442695040888963407
+        return Double(state >> 11) / Double(UInt64(1) << 53)
+    }
+}
+
 struct TopScrim: View {
     var body: some View {
         LinearGradient(stops: [.init(color: Theme.bg, location: 0),
@@ -429,6 +474,7 @@ struct HomeView: View {
     var stage: some View {
         ZStack(alignment: .top) {
             stageMap.ignoresSafeArea(edges: .top)
+            if zoomedOut { Starfield().ignoresSafeArea(edges: .top).transition(.opacity) }
             // Scrims: a legible brand bar under the status bar, and a fade into the page so the cards sit on black.
             VStack(spacing: 0) {
                 // 150 = ~59 safe area + 4 + 44 pill + ~40 of fade, so the bar is scrimmed on every device.
@@ -462,6 +508,7 @@ struct HomeView: View {
                 stageFooter
             }
         }
+        .animation(.easeInOut(duration: 0.6), value: zoomedOut)
     }
 
     var stageMap: some View {
@@ -505,7 +552,7 @@ struct HomeView: View {
             } label: {
                 HStack(spacing: 6) {
                     StatusDot(color: ready.vpnUp ? Theme.ok : Theme.warn)
-                    Text(ready.vpnInstalled ? (ready.vpnUp ? (engine.isActive ? "VPN on · keep it on" : "VPN on") : "VPN off") : "Get VPN").font(.caption.weight(.semibold)).foregroundStyle(Theme.muted)
+                    Text(ready.vpnInstalled ? (ready.vpnUp ? (engine.isActive ? "Link ready · keep it on" : "Link ready") : "Link off") : "Get link app").font(.caption.weight(.semibold)).foregroundStyle(Theme.muted)
                 }
                 .padding(.horizontal, 10).padding(.vertical, 6)
                 .background(.ultraThinMaterial)
