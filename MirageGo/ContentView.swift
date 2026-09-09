@@ -92,6 +92,9 @@ final class Readiness: ObservableObject {
     }
 
     func refresh() {
+        // A pairing file pushed from the PC while the app is already in the foreground is adopted by this poll
+        // (App.init and the .active handler only cover launch / background -> foreground).
+        if !pairing { PairingStore.adoptFromDocuments() }
         let vi = VPNHelper.installed, vu = VPNHelper.tunnelUp, k = PairingStore.kind, p = k == PairingStore.remoteKind
         let d = DDIStore.present, a = LocationKeeper.shared.authorization
         if vi != vpnInstalled { vpnInstalled = vi }
@@ -115,6 +118,10 @@ struct ContentView: View {
     // Map camera lives here so switching tabs does not reset the user's zoom.
     @State private var camera: MapCameraPosition = .automatic
     @State private var didCenter = false
+    // The bottom inset is keyboard-aware, so it would float above the keyboard while typing; hide it instead
+    // (native tab bars stay under the keyboard). Not `.ignoresSafeArea(.keyboard)`: the Settings IP/Port fields
+    // near the bottom of their scroll still need keyboard avoidance.
+    @State private var keyboardUp = false
 
     var body: some View {
         ZStack {
@@ -127,17 +134,25 @@ struct ContentView: View {
                 }
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+            withAnimation(.easeOut(duration: 0.2)) { keyboardUp = true }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            withAnimation(.easeOut(duration: 0.2)) { keyboardUp = false }
+        }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            VStack(spacing: 8) {
-                if tab == 0 { PrimaryActionBar(showSetup: $showSetup) }
-                GlassTabBar(tab: $tab)
+            if !keyboardUp {
+                VStack(spacing: 8) {
+                    if tab == 0 { PrimaryActionBar(showSetup: $showSetup) }
+                    GlassTabBar(tab: $tab)
+                }
+                .padding(.top, 8)
+                .background(
+                    LinearGradient(colors: [Theme.bg.opacity(0), Theme.bg.opacity(0.92)], startPoint: .top, endPoint: .center)
+                        .ignoresSafeArea()
+                        .allowsHitTesting(false)
+                )
             }
-            .padding(.top, 8)
-            .background(
-                LinearGradient(colors: [Theme.bg.opacity(0), Theme.bg.opacity(0.92)], startPoint: .top, endPoint: .center)
-                    .ignoresSafeArea()
-                    .allowsHitTesting(false)
-            )
         }
         .sheet(isPresented: $showSetup) { SetupView().environmentObject(engine).environmentObject(ready) }
         .onAppear { if !ready.allGood && !UserDefaults.standard.bool(forKey: "setupSeen") { showSetup = true } }
@@ -255,21 +270,22 @@ struct HomeView: View {
     @AppStorage("mapHintSeen") private var mapHintSeen = false
     let clock = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
+    /// While the link is being rebuilt the phone shows its REAL location, so that state must not look like "Spoofing".
     var statusColor: Color {
         switch engine.phase {
-        case .active: return Theme.ok
+        case .active: return engine.rebuilding ? Theme.warn : Theme.ok
         case .connecting: return Theme.warn
-        case .idle: return engine.error == nil ? Theme.idle : Theme.danger
+        case .idle: return Theme.idle   // the error card carries the red; the headline is not the failure
         }
     }
     var statusText: String {
         switch engine.phase {
-        case .active: return "Spoofing"
+        case .active: return engine.rebuilding ? "Reconnecting…" : "Spoofing"
         case .connecting: return "Connecting…"
         case .idle: return "Real location"
         }
     }
-    /// Smaller map on short phones so the location card is not pushed off-screen.
+    /// Smaller map on short phones.
     var mapHeight: CGFloat { UIScreen.main.bounds.height < 750 ? 220 : 260 }
 
     var body: some View {
@@ -277,15 +293,15 @@ struct HomeView: View {
             VStack(spacing: 14) {
                 brandBar
                 hero
-                mapCard
+                // Transient status sits directly under the hero, above the map, so a 30-90 s first Connect (or its
+                // failure) is readable without scrolling past a map that captures drags.
                 if !engine.steps.isEmpty { stepsCard }
-                if engine.travel != nil { travelCard }
                 if let err = engine.error { errorCard(err) }
+                mapCard
+                if engine.travel != nil { travelCard }
                 if net.cellularOnly && !ready.vpnUp && engine.phase != .active { cellularTip }
                 locationCard
-                Text("Keep LocalDev VPN connected while spoofing. Disconnect restores the real location.")
-                    .font(.caption2).foregroundStyle(Theme.dim).multilineTextAlignment(.center).padding(.horizontal, 36)
-                    .padding(.bottom, 8)
+                Color.clear.frame(height: 8)
             }
             .padding(.top, 6)
         }
@@ -305,14 +321,14 @@ struct HomeView: View {
             } label: {
                 HStack(spacing: 6) {
                     StatusDot(color: ready.vpnUp ? Theme.ok : Theme.warn)
-                    Text(ready.vpnInstalled ? (ready.vpnUp ? "VPN on" : "VPN off") : "Get VPN").font(.caption).foregroundStyle(Theme.muted)
+                    Text(ready.vpnInstalled ? (ready.vpnUp ? (engine.isActive ? "VPN on · keep it on" : "VPN on") : "VPN off") : "Get VPN").font(.caption).foregroundStyle(Theme.muted)
                 }
                 .padding(.horizontal, 10).padding(.vertical, 6).background(Theme.card).clipShape(Capsule())
                 .frame(minHeight: 44)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel(ready.vpnInstalled ? (ready.vpnUp ? "VPN connected" : "VPN off, tap to open LocalDev VPN") : "LocalDev VPN not installed, tap to get it from the App Store")
+            .accessibilityLabel(ready.vpnInstalled ? (ready.vpnUp ? (engine.isActive ? "VPN connected, keep it connected while spoofing" : "VPN connected") : "VPN off, tap to open LocalDev VPN") : "LocalDev VPN not installed, tap to get it from the App Store")
         }
         .padding(.horizontal, 20)
     }
@@ -322,9 +338,9 @@ struct HomeView: View {
             ZStack {
                 Circle().fill(statusColor.opacity(0.14)).frame(width: 96, height: 96)
                 Circle().stroke(statusColor.opacity(0.35), lineWidth: 1).frame(width: 96, height: 96)
-                Image(systemName: engine.phase == .active ? "location.fill" : "location.slash.fill")
+                Image(systemName: engine.phase == .active && !engine.rebuilding ? "location.fill" : "location.slash.fill")
                     .font(.system(size: 36, weight: .semibold)).foregroundStyle(statusColor)
-                    .shadow(color: statusColor.opacity(engine.phase == .idle && engine.error == nil ? 0.25 : 0.7), radius: 14)
+                    .shadow(color: statusColor.opacity(engine.phase == .idle ? 0.25 : 0.7), radius: 14)
             }
             Text(statusText).font(.largeTitle.bold()).foregroundStyle(statusColor)
             Text(subline).font(.footnote).foregroundStyle(Theme.muted).multilineTextAlignment(.center).padding(.horizontal, 30)
@@ -335,6 +351,7 @@ struct HomeView: View {
     }
 
     var subline: String {
+        if engine.phase == .active && engine.rebuilding { return "The link dropped — your real location may show until it is back" }
         if engine.phase == .active {
             let ago = engine.lastSetAt.map { Int(now.timeIntervalSince($0)) } ?? 0
             return ago > 15
@@ -344,7 +361,7 @@ struct HomeView: View {
         if engine.phase == .connecting { return "Setting up the link to this phone" }
         if !ready.vpnInstalled { return "Install LocalDev VPN to get started" }
         if !ready.pairing { return "Import the pairing file from the PC" }
-        return "Apps see where this iPhone really is"
+        return "Connect to appear in \(engine.positionName)"
     }
 
     var mapCard: some View {
@@ -357,7 +374,8 @@ struct HomeView: View {
                         MapPolyline(coordinates: [engine.position, tr.to]).stroke(.white.opacity(0.8), style: StrokeStyle(lineWidth: 2, dash: [4, 6]))
                     }
                     if let p = pending {
-                        Annotation("", coordinate: p) { Image(systemName: "mappin").font(.title2).foregroundStyle(.white).shadow(radius: 4) }
+                        // Bottom anchor: the pin's tip sits on the tapped point, not its centre.
+                        Annotation("", coordinate: p, anchor: .bottom) { Image(systemName: "mappin").font(.title2).foregroundStyle(.white).shadow(radius: 4) }
                     }
                 }
                 .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll, showsTraffic: false))
@@ -386,10 +404,12 @@ struct HomeView: View {
                 Text(Geo.fmt(p)).font(.caption.monospacedDigit()).foregroundStyle(.white).lineLimit(1)
                     .padding(.horizontal, 10).padding(.vertical, 6).background(.ultraThinMaterial).clipShape(Capsule())
                 Spacer(minLength: 4)
-                Button("Go here") {
+                // Same behaviour as a Places tap: when idle and set up, "Go here" actually connects.
+                Button(ready.allGood || engine.phase != .idle ? "Go here" : "Pick here") {
                     UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                     engine.pick(p, name: "Custom point")
                     pending = nil
+                    if engine.phase == .idle && ready.allGood { engine.connect() }
                 }
                 .buttonStyle(Button3D(compact: true)).frame(width: 110)
                 Button { withAnimation(.easeOut(duration: 0.15)) { pending = nil } } label: {
@@ -401,8 +421,15 @@ struct HomeView: View {
         } else {
             HStack {
                 if mapHintSeen {
-                    Text(Geo.fmt(engine.position)).font(.caption.monospacedDigit()).foregroundStyle(.white)
-                        .padding(.horizontal, 10).padding(.vertical, 6).background(.ultraThinMaterial).clipShape(Capsule())
+                    // The place name, not bare coordinates: this is what Connect will make the phone appear at.
+                    VStack(alignment: .leading, spacing: 2) {
+                        Label(engine.positionName, systemImage: "mappin").font(.caption.weight(.semibold)).foregroundStyle(.white).lineLimit(1)
+                        if engine.positionName == "Custom point" {
+                            Text(Geo.fmt(engine.position)).font(.caption2.monospacedDigit()).foregroundStyle(Theme.muted)
+                        }
+                    }
+                    .padding(.horizontal, 10).padding(.vertical, 6).background(.ultraThinMaterial)
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 } else {
                     Label("Tap the map to drop a pin", systemImage: "hand.tap").font(.caption).foregroundStyle(Theme.muted)
                         .padding(.horizontal, 10).padding(.vertical, 6).background(.ultraThinMaterial).clipShape(Capsule())
@@ -503,7 +530,7 @@ struct HomeView: View {
     var locationCard: some View {
         Card {
             VStack(alignment: .leading, spacing: 12) {
-                Text("Simulated location").font(.caption).foregroundStyle(Theme.muted)
+                Text(engine.isActive ? "Simulated location" : "Next place").font(.caption).foregroundStyle(Theme.muted)
                 HStack(spacing: 12) {
                     Text(placeIcon).font(.title2).frame(width: 44, height: 44).background(Theme.card2).clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                     VStack(alignment: .leading, spacing: 2) {
@@ -513,7 +540,8 @@ struct HomeView: View {
                     Spacer()
                 }
                 Button("Change place") { tab = 1 }.buttonStyle(Button3D(dark: true))
-                if engine.phase != .idle || engine.error != nil {
+                // Only while something is running; when idle the error card's Dismiss is the right control.
+                if engine.phase != .idle {
                     Button {
                         UINotificationFeedbackGenerator().notificationOccurred(.warning)
                         engine.kill()
@@ -551,6 +579,10 @@ struct PulseDot: View {
 final class SearchModel: NSObject, ObservableObject, MKLocalSearchCompleterDelegate {
     @Published var query = "" { didSet { completer.queryFragment = query } }
     @Published var results: [MKLocalSearchCompletion] = []
+    /// The completer reported an error (offline is the normal state on cellular with Airplane Mode on).
+    @Published var failed = false
+    /// An MKLocalSearch for a tapped result is in flight (1-3 s); the row shows a spinner and taps are ignored.
+    @Published var resolving = false
     private let completer = MKLocalSearchCompleter()
 
     override init() {
@@ -559,16 +591,19 @@ final class SearchModel: NSObject, ObservableObject, MKLocalSearchCompleterDeleg
         completer.resultTypes = [.address, .pointOfInterest]
     }
 
-    func completerDidUpdateResults(_ c: MKLocalSearchCompleter) { results = c.results }
-    func completer(_ c: MKLocalSearchCompleter, didFailWithError error: Error) { results = [] }
+    func completerDidUpdateResults(_ c: MKLocalSearchCompleter) { results = c.results; failed = false }
+    func completer(_ c: MKLocalSearchCompleter, didFailWithError error: Error) { results = []; failed = true }
 
+    @MainActor
     func resolve(_ completion: MKLocalSearchCompletion) async -> CLLocationCoordinate2D? {
+        resolving = true
+        defer { resolving = false }
         let search = MKLocalSearch(request: MKLocalSearch.Request(completion: completion))
         guard let response = try? await search.start() else { return nil }
         return response.mapItems.first?.placemark.coordinate
     }
 
-    func clear() { query = ""; results = [] }
+    func clear() { query = ""; results = []; failed = false }
 }
 
 struct PlacesView: View {
@@ -588,6 +623,9 @@ struct PlacesView: View {
 
     var favs: [Place] { store.places.filter { $0.fav }.sorted { $0.name < $1.name } }
     var rest: [Place] { store.places.filter { !$0.fav }.sorted { $0.name < $1.name } }
+    /// What "Save map point" stores: the destination while travelling (position is an interpolated road point then).
+    var saveTarget: CLLocationCoordinate2D { engine.travel?.to ?? engine.position }
+    var alreadySaved: Bool { engine.travel == nil && store.places.contains { Geo.distance($0.coordinate, engine.position) < 2 } }
 
     var body: some View {
         ScrollView(showsIndicators: false) {
@@ -601,11 +639,17 @@ struct PlacesView: View {
                 searchCard
 
                 HStack(spacing: 8) {
-                    Button { newName = engine.positionName == "Custom point" ? "" : engine.positionName; naming = true } label: {
-                        Label("Save map point", systemImage: "plus")
+                    if !alreadySaved {
+                        Button {
+                            let n = engine.travel?.name ?? engine.positionName
+                            newName = n == "Custom point" ? "" : n
+                            naming = true
+                        } label: {
+                            Label("Save map point", systemImage: "plus")
+                        }
+                        .buttonStyle(Button3D(dark: true, compact: true))
                     }
-                    .buttonStyle(Button3D(dark: true, compact: true))
-                    Button { latText = ""; lonText = ""; coordsEntry = true } label: {
+                    Button { searchError = nil; coordsEntry = true } label: {
                         Label("Coordinates", systemImage: "number")
                     }
                     .buttonStyle(Button3D(dark: true, compact: true))
@@ -618,30 +662,39 @@ struct PlacesView: View {
             }
         }
         .scrollDismissesKeyboard(.interactively)
+        // A stale red error must not persist while the user retypes.
+        .onChange(of: search.query) { _, _ in searchError = nil }
         .alert("Save this point", isPresented: $naming) {
             TextField("Name", text: $newName)
             Button("Save") {
                 var n = newName.trimmingCharacters(in: .whitespaces)
                 if n.isEmpty { n = "My place" }
                 if store.places.contains(where: { $0.name == n }) { n += " 2" }
-                withAnimation { store.add(name: n, at: engine.position, icon: "📍") }
-                engine.positionName = n
+                withAnimation { store.add(name: n, at: saveTarget, icon: "📍") }
+                if engine.travel == nil { engine.positionName = n }
             }
             Button("Cancel", role: .cancel) {}
-        } message: { Text(Geo.fmt(engine.position)) }
+        } message: { Text(Geo.fmt(saveTarget)) }
         .alert("Enter coordinates", isPresented: $coordsEntry) {
             TextField("Latitude (e.g. 34.0522)", text: $latText).keyboardType(.numbersAndPunctuation)
             TextField("Longitude (e.g. -118.2437)", text: $lonText).keyboardType(.numbersAndPunctuation)
             Button("Go") {
                 if let lat = Double(latText.trimmingCharacters(in: .whitespaces)), let lon = Double(lonText.trimmingCharacters(in: .whitespaces)),
                    (-90...90).contains(lat), (-180...180).contains(lon) {
+                    latText = ""; lonText = ""; searchError = nil
                     go(CLLocationCoordinate2D(latitude: lat, longitude: lon), name: "Custom point")
                 } else {
+                    // Keep what was typed and re-open the dialog with the message in it, instead of surfacing the
+                    // error in the search card after the dialog has closed.
                     searchError = "Coordinates must be latitude -90…90 and longitude -180…180."
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .milliseconds(350))
+                        coordsEntry = true
+                    }
                 }
             }
-            Button("Cancel", role: .cancel) {}
-        } message: { Text("Decimal degrees, as shown on any map app.") }
+            Button("Cancel", role: .cancel) { latText = ""; lonText = ""; searchError = nil }
+        } message: { Text(searchError ?? "Decimal degrees, as shown on any map app.") }
         .alert("Delete \(pendingDelete?.name ?? "")?", isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } })) {
             Button("Delete", role: .destructive) { if let p = pendingDelete { withAnimation { store.delete(p) } }; pendingDelete = nil }
             Button("Cancel", role: .cancel) { pendingDelete = nil }
@@ -675,12 +728,19 @@ struct PlacesView: View {
                 Label(e, systemImage: "exclamationmark.triangle.fill").font(.caption.weight(.semibold)).foregroundStyle(Theme.danger)
                     .padding(.horizontal, 12).padding(.bottom, 10)
             }
+            // Offline is this app's normal state on cellular, so an empty list needs to say why it is empty.
+            if !search.query.isEmpty && search.results.isEmpty {
+                Text(search.failed
+                     ? "No internet (Airplane Mode?). Search is off — tap the map or use Coordinates instead."
+                     : search.query.count < 3 ? "Keep typing…" : "No matches")
+                    .font(.caption).foregroundStyle(Theme.dim).frame(maxWidth: .infinity, alignment: .leading).padding(12)
+            }
             if !search.results.isEmpty && !search.query.isEmpty {
                 Divider().overlay(Theme.line)
                 ForEach(Array(search.results.prefix(6).enumerated()), id: \.offset) { _, r in
                     Button { pick(r) } label: {
                         HStack(spacing: 10) {
-                            Image(systemName: "mappin.circle").foregroundStyle(Theme.muted)
+                            if search.resolving { ProgressView().tint(Theme.muted) } else { Image(systemName: "mappin.circle").foregroundStyle(Theme.muted) }
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(r.title).font(.subheadline.weight(.semibold)).foregroundStyle(.white).lineLimit(1)
                                 if !r.subtitle.isEmpty { Text(r.subtitle).font(.caption).foregroundStyle(Theme.dim).lineLimit(1) }
@@ -700,10 +760,11 @@ struct PlacesView: View {
     }
 
     func pick(_ r: MKLocalSearchCompletion) {
+        guard !search.resolving else { return }   // a second tap must not start a second go()
         searchError = nil
         Task {
             if let c = await search.resolve(r) { go(c, name: r.title) }
-            else { searchError = "Could not find that place. Try a more specific search." }
+            else { searchError = "Could not look that place up — check you have internet." }
         }
     }
 
@@ -720,7 +781,11 @@ struct PlacesView: View {
                             Text(Geo.fmt(p.coordinate)).font(.caption.monospacedDigit()).foregroundStyle(Theme.dim)
                         }
                         Spacer()
-                        if selected { Text(engine.isActive ? "Here" : "Selected").font(.caption2.weight(.bold)).padding(.horizontal, 8).padding(.vertical, 4).background(engine.isActive ? Theme.ok : Color.white).foregroundStyle(.black).clipShape(Capsule()) }
+                        if selected {
+                            // "Here" only while the channel is really open; during a rebuild the phone shows its real location.
+                            let here = engine.isActive && !engine.rebuilding
+                            Text(here ? "Here" : "Selected").font(.caption2.weight(.bold)).padding(.horizontal, 8).padding(.vertical, 4).background(here ? Theme.ok : Color.white).foregroundStyle(.black).clipShape(Capsule())
+                        }
                         Button { withAnimation { store.toggleFav(p) } } label: {
                             Image(systemName: p.fav ? "star.fill" : "star").foregroundStyle(p.fav ? .white : Theme.dim)
                                 .frame(width: 44, height: 44).contentShape(Rectangle())
@@ -812,7 +877,7 @@ struct SettingsView: View {
                         if importOK {
                             Label("Pairing file imported", systemImage: "checkmark.circle.fill").font(.caption.weight(.semibold)).foregroundStyle(Theme.ok)
                         }
-                        Text("Or drop pairingFile.plist into the Mirage Go folder (Files app or Apple Devices file sharing); it is picked up on the next launch.").font(.caption).foregroundStyle(Theme.dim)
+                        Text("Or drop pairingFile.plist into the Mirage Go folder (Files app or Apple Devices file sharing); it is picked up automatically.").font(.caption).foregroundStyle(Theme.dim)
                     }
                     Group {
                         statusRow("Developer image", ready.ddiFiles ? (engine.ddiStatus == "mounted" ? "Ready · mounted" : "Files ready") : "Not downloaded yet", ready.ddiFiles ? Theme.ok : Theme.warn)
@@ -830,6 +895,12 @@ struct SettingsView: View {
                     }
                     Group {
                         statusRow("Background location", authText, authColor)
+                        if ready.locationAuth == .authorizedWhenInUse {
+                            // The one-shot "Always" upgrade prompt is asked here, in the foreground with nothing
+                            // pending, so no app switch can dismiss it (it used to be burned inside Connect).
+                            Button("Allow Always") { LocationKeeper.shared.requestAlwaysUpgrade() }
+                                .buttonStyle(Button3D(compact: true))
+                        }
                         if ready.locationAuth != .authorizedAlways {
                             Button("Open iOS Settings") { if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) } }
                                 .buttonStyle(Button3D(dark: true, compact: true))
@@ -971,7 +1042,7 @@ struct SetupView: View {
             ScrollView(showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 14) {
                     Text("Four things, once. After that it's just Connect.").font(.footnote).foregroundStyle(Theme.muted).padding(.horizontal, 4)
-                    step(1, "LocalDev VPN", ready.vpnUp ? "Connected" : ready.vpnInstalled ? "Installed. Open it and tap Connect." : "Install it from the App Store, open it once, allow the VPN configuration.",
+                    step(1, "LocalDev VPN", ready.vpnUp ? "Connected" : ready.vpnInstalled ? "Installed. Open it and tap Connect." : "Free app on the App Store. Open it, tap Connect, and tap Allow when the phone asks about a VPN.",
                          ok: ready.vpnUp, partial: ready.vpnInstalled) {
                         Button(ready.vpnInstalled ? "Open LocalDev VPN" : "Get LocalDev VPN") {
                             if ready.vpnInstalled { VPNHelper.open() } else { VPNHelper.openStore() }
@@ -979,12 +1050,12 @@ struct SetupView: View {
                     }
                     step(2, "Pairing file",
                          ready.pairing ? "Imported (\(ready.pairingKind))"
-                            : ready.pairingKind == "none" ? "Made on the PC with the cable (idevice_pair → Remote pairing → Save to file). Import it here, or have it dropped into the Mirage Go folder."
-                            : "The imported file is a \(ready.pairingKind) record. Make a Remote pairing file in idevice_pair and import that instead.",
+                            : ready.pairingKind == "none" ? "A small file made on the PC while the phone is plugged in. It is usually already on the phone when you get the app. If this isn't green, ask for pairingFile.plist and tap Import."
+                            : "This file is the USB kind and won't work. Ask for a new Remote pairing file from the PC and import that one.",
                          ok: ready.pairing, partial: false, error: importError, success: importOK ? "Pairing file imported" : nil) {
                         Button("Import pairing file…") { importing = true }
                     }
-                    step(3, "Developer image", ready.ddiFiles ? "Downloaded. It gets signed by Apple on the first Connect (needs internet)." : "16 MB download. Mirage Go grabs it on the first Connect, or now.",
+                    step(3, "Developer image", ready.ddiFiles ? "Downloaded. The first Connect needs internet to finish this step." : "16 MB download. Mirage Go grabs it on the first Connect, or now.",
                          ok: ready.ddiFiles, partial: false, error: downloadError) {
                         Button(busy.isEmpty ? "Download now" : busy) {
                             Task {
@@ -994,7 +1065,7 @@ struct SetupView: View {
                             }
                         }.disabled(!busy.isEmpty)
                     }
-                    step(4, "Developer Mode", devMode ? "On" : "Settings → Privacy & Security → Developer Mode → On, then restart. Mirage Go cannot check this for you.",
+                    step(4, "Developer Mode", devMode ? "On" : "Settings → Privacy & Security → Developer Mode → On, then restart the phone. Mirage Go cannot check this for you.",
                          ok: devMode, partial: false) {
                         Button("I turned it on") { devMode = true }
                     }
@@ -1002,12 +1073,14 @@ struct SetupView: View {
                         HStack(alignment: .top, spacing: 10) {
                             Image(systemName: "wifi").foregroundStyle(Theme.warn)
                             VStack(alignment: .leading, spacing: 3) {
-                                Text("Wi-Fi for the first run").font(.subheadline.weight(.semibold))
-                                Text("The first Connect needs internet to get the developer image signed, and iOS will ask for Local Network and Location (choose Always). After that, cellular works with Airplane Mode on while you connect.").font(.caption).foregroundStyle(Theme.muted)
+                                Text("Do the first Connect on Wi-Fi").font(.subheadline.weight(.semibold))
+                                Text("Tap Allow when the phone asks about the local network and choose Always for location. No Wi-Fi later? Airplane Mode on → LocalDev VPN Connect → Mirage Go Connect → cellular back on (leave Airplane Mode on).").font(.caption).foregroundStyle(Theme.muted)
                             }
                         }
                     }
-                    Button("Done") { UserDefaults.standard.set(true, forKey: "setupSeen"); dismiss() }.buttonStyle(Button3D()).padding(.top, 4)
+                    // Must not read as "finished" while steps are still open.
+                    Button(ready.allGood ? "Done — go Connect" : "Close for now") { UserDefaults.standard.set(true, forKey: "setupSeen"); dismiss() }
+                        .buttonStyle(Button3D(dark: !ready.allGood)).padding(.top, 4)
                 }
                 .padding(16)
             }

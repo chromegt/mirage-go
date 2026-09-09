@@ -40,6 +40,13 @@ enum PairingStore {
     /// so a file dropped there is adopted automatically. A Documents copy is adopted at most once: it is skipped
     /// when it is byte-identical to the installed file, and it is renamed to `*.imported.plist` afterwards, so it
     /// can never overwrite a file the user imported later through the picker.
+    ///
+    /// Also called from the 1 s Readiness poll while no usable file is installed, so a file pushed while the app is
+    /// in the foreground is picked up too. A candidate written in the last 2 s is skipped (an AFC upload may still
+    /// be in progress); a candidate that was rejected is remembered by path + modification date so it is not
+    /// re-read and re-logged every second.
+    private static var rejected: Set<String> = []
+
     static func adoptFromDocuments() {
         let fm = FileManager.default
         let candidates = ["pairingFile.plist", "pairing.plist", "pairing_file.plist"]
@@ -48,6 +55,10 @@ enum PairingStore {
                 .filter { $0.pathExtension == "mobiledevicepairing" || $0.pathExtension == "mobiledevicepair" }
         let installed = try? Data(contentsOf: url)
         for c in candidates where fm.fileExists(atPath: c.path) {
+            let modified = (try? fm.attributesOfItem(atPath: c.path)[.modificationDate] as? Date) ?? .distantPast
+            if Date().timeIntervalSince(modified) < 2 { continue }   // still being written
+            let stamp = "\(c.path)@\(modified.timeIntervalSince1970)"
+            if rejected.contains(stamp) { continue }
             if let installed, let candidate = try? Data(contentsOf: c), candidate == installed { continue }
             do {
                 try install(from: c)
@@ -57,6 +68,7 @@ enum PairingStore {
                 try? fm.moveItem(at: c, to: aside)
                 return
             } catch {
+                rejected.insert(stamp)
                 AppLog.shared.add("Documents/\(c.lastPathComponent) not adopted: \(error.localizedDescription)")
             }
         }
@@ -70,7 +82,7 @@ enum PairingStore {
         // Only a Remote pairing file (public_key/private_key/identifier) works over the loopback tunnel.
         guard plist["public_key"] != nil else {
             let msg = plist["HostID"] != nil
-                ? "That is a USB (lockdown) pairing file. In idevice_pair choose Remote pairing, then Save to file."
+                ? "This file is the USB kind and won't work. Ask for a new Remote pairing file from the PC and import that one."
                 : "That file is not a pairing file."
             throw NSError(domain: "MirageGo", code: 3, userInfo: [NSLocalizedDescriptionKey: msg])
         }
@@ -102,9 +114,12 @@ enum DDIStore {
     static var manifest: URL { dir.appendingPathComponent("BuildManifest.plist") }
     static let base = "https://github.com/doronz88/DeveloperDiskImage/raw/refs/heads/main/PersonalizedImages/Xcode_iOS_DDI_Personalized/"
 
-    static var present: Bool {
-        let fm = FileManager.default
-        return fm.fileExists(atPath: image.path) && fm.fileExists(atPath: trustCache.path) && fm.fileExists(atPath: manifest.path)
+    /// A 0-byte file (interrupted write) counts as absent so `download` fetches it again instead of mounting it.
+    static var present: Bool { [image, trustCache, manifest].allSatisfy(nonEmpty) }
+
+    private static func nonEmpty(_ u: URL) -> Bool {
+        guard let size = try? FileManager.default.attributesOfItem(atPath: u.path)[.size] as? NSNumber else { return false }
+        return size.int64Value > 0
     }
 
     /// Deletes the three files so `download` fetches them again.
@@ -117,7 +132,7 @@ enum DDIStore {
     static func download(progress: @escaping (String) -> Void) async throws {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         for (name, dest) in [("BuildManifest.plist", manifest), ("Image.dmg.trustcache", trustCache), ("Image.dmg", image)] {
-            if FileManager.default.fileExists(atPath: dest.path) { continue }
+            if nonEmpty(dest) { continue }
             progress("Downloading \(name)…")
             guard let url = URL(string: base + name) else { continue }
             let (tmp, resp) = try await URLSession.shared.download(from: url)

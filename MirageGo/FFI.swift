@@ -96,9 +96,10 @@ final class DeviceTunnel {
             if PairingDiag.pinRequested { throw FFIError.pairingRejected(error.localizedDescription) }
             throw error
         }
-        guard let adapter, let handshake else { t.close(); throw FFIError.noHandle("tunnel") }
+        // Store both out-params first so close() frees whichever one was populated if the other is missing.
         t.adapter = adapter
         t.handshake = handshake
+        guard adapter != nil, handshake != nil else { t.close(); throw FFIError.noHandle("tunnel") }
         return t
     }
 
@@ -116,7 +117,17 @@ final class DeviceTunnel {
         handshake = nil; adapter = nil; pairing = nil
     }
 
-    deinit { close() }
+    /// Safety net only (every path closes explicitly on ffiQueue). If a handle is still alive here, free it on
+    /// ffiQueue rather than on whatever thread dropped the last reference, so it can never race an in-flight call.
+    deinit {
+        let h = handshake, a = adapter, p = pairing
+        guard h != nil || a != nil || p != nil else { return }
+        ffiQueue.async {
+            if let h { rsd_handshake_free(h) }
+            if let a { adapter_free(a) }
+            if let p { rp_pairing_file_free(p) }
+        }
+    }
 }
 
 /// The DVT LocationSimulation channel. The simulated location lives only while this stays open.
@@ -152,7 +163,15 @@ final class LocationChannel {
         sim = nil; server = nil
     }
 
-    deinit { close() }
+    /// Safety net only; see DeviceTunnel.deinit. Sim first: its stream borrows the server.
+    deinit {
+        let s = sim, r = server
+        guard s != nil || r != nil else { return }
+        ffiQueue.async {
+            if let s { location_simulation_free(s) }
+            if let r { remote_server_free(r) }
+        }
+    }
 }
 
 /// Developer disk image checks and personalized mounting through the tunnel.
@@ -182,6 +201,9 @@ enum DDIMounter {
         let imageData = try Data(contentsOf: image, options: .mappedIfSafe)
         let tcData = try Data(contentsOf: trustCache)
         let bmData = try Data(contentsOf: manifest)
+        // A 0-byte leftover from an interrupted write would reach the Rust side as (NULL, 0): slice::from_raw_parts
+        // on a null pointer is UB there, so refuse empty files up front (DDIStore.present also treats them as absent).
+        guard !imageData.isEmpty, !tcData.isEmpty, !bmData.isEmpty else { throw FFIError.noHandle("developer image files (empty file)") }
 
         // Scoped so the lockdown stream is freed (also on a throw) before the mount starts.
         let ecid: UInt64 = try {

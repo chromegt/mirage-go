@@ -108,19 +108,49 @@ final class LocationKeeper: NSObject, CLLocationManagerDelegate {
 
     var authorization: CLAuthorizationStatus { manager.authorizationStatus }
 
+    /// Continuations parked by `requestAndWait()`; resumed from the delegate or by the timeout, whichever is first.
+    private var authWaiters: [CheckedContinuation<Void, Never>] = []
+
+    /// Starts updates when permission is already decided. It no longer asks for permission itself: a permission
+    /// alert is dismissed the moment the app resigns active, and Connect app-switches to LocalDev VPN right after
+    /// this runs. `requestAndWait()` handles the first-run prompt before that switch; the When-In-Use -> Always
+    /// upgrade is offered from Settings (foreground, nothing pending).
     func start() {
         running = true
         switch manager.authorizationStatus {
-        case .authorizedAlways:
+        case .authorizedAlways, .authorizedWhenInUse:
             manager.startUpdatingLocation()
-        case .authorizedWhenInUse:
-            // Start now (the "Always" upgrade prompt is shown at most once and may never change the status).
-            manager.startUpdatingLocation()
-            manager.requestAlwaysAuthorization()
         case .notDetermined:
+            // Fallback only (Connect normally awaited requestAndWait() already); a second request is a no-op.
             manager.requestAlwaysAuthorization()
         default: break
         }
+    }
+
+    /// First run: shows the location prompt and suspends until the user answers (or `timeout` passes, e.g. when the
+    /// alert was dismissed by an app switch). Returns immediately when the status is already determined.
+    /// Call from the main actor while the app is in the foreground.
+    @MainActor
+    func requestAndWait(timeout: TimeInterval = 30) async {
+        guard manager.authorizationStatus == .notDetermined else { return }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            authWaiters.append(cont)
+            manager.requestAlwaysAuthorization()
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) { [weak self] in self?.resumeAuthWaiters() }
+        }
+    }
+
+    /// The one-shot "Always" upgrade prompt (only shown by iOS once per install). Meant for the Settings row, in the
+    /// foreground, so no app switch can dismiss it.
+    func requestAlwaysUpgrade() {
+        guard manager.authorizationStatus == .authorizedWhenInUse else { return }
+        manager.requestAlwaysAuthorization()
+    }
+
+    private func resumeAuthWaiters() {
+        let waiters = authWaiters
+        authWaiters = []
+        for w in waiters { w.resume() }
     }
 
     func stop() {
@@ -129,6 +159,7 @@ final class LocationKeeper: NSObject, CLLocationManagerDelegate {
     }
 
     func locationManagerDidChangeAuthorization(_ m: CLLocationManager) {
+        if m.authorizationStatus != .notDetermined { resumeAuthWaiters() }
         guard running else { return }
         if m.authorizationStatus == .authorizedAlways || m.authorizationStatus == .authorizedWhenInUse { m.startUpdatingLocation() }
     }

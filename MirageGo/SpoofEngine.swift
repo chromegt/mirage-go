@@ -37,7 +37,13 @@ final class SpoofEngine: ObservableObject {
     private var stopping = false
     private var connectTask: Task<Void, Never>?
     private var rebuildTask: Task<Void, Never>?
-    private var rebuilding = false
+    /// True while the link is being rebuilt after a drop. The channel is closed for that whole window, so the phone
+    /// shows its REAL location; the UI renders this as a distinct warning state, not as "Spoofing".
+    @Published private(set) var rebuilding = false
+    /// Set by MirageGoApp when LocalDev VPN's miragego:// callback arrives; used as a wake-up by the VPN wait.
+    private var vpnCallback = false
+    /// True while the (uncancellable, 30-90 s) DDI mount holds ffiQueue, so a following Connect can say why it waits.
+    private var ffiBusy = false
     private let settings = AppSettings.shared
 
     // send() coalescing: at most one location_simulation_set is ever queued on ffiQueue.
@@ -92,10 +98,18 @@ final class SpoofEngine: ObservableObject {
         guard phase == .connecting else { return }
         stopping = true
         connectTask?.cancel(); connectTask = nil
+        // A mount that is still running on ffiQueue must not write "mounting NN%" into the next session's steps.
+        DDIMounter.progress = { _ in }
         teardownHandles()
         phase = .idle
         steps = []
         AppLog.shared.add("connect cancelled")
+    }
+
+    /// LocalDev VPN opened miragego:// (fixed 1 s after it started its tunnel).
+    func vpnCallbackArrived() {
+        vpnCallback = true
+        AppLog.shared.add("LocalDev VPN callback received")
     }
 
     private func step(_ id: String, _ status: String, _ detail: String = "") {
@@ -108,6 +122,7 @@ final class SpoofEngine: ObservableObject {
         error = message; self.hint = hint
         phase = .idle
         connectTask = nil
+        DDIMounter.progress = { _ in }
         teardownHandles()
     }
 
@@ -115,15 +130,37 @@ final class SpoofEngine: ObservableObject {
     private var aborted: Bool { Task.isCancelled || stopping }
 
     private func runConnect(_ target: CLLocationCoordinate2D) async {
+        // 0. First run: the location prompt must be answered BEFORE the VPN app-switch, or iOS dismisses it when
+        //    the app resigns active and the session runs without the location keeper.
+        if LocationKeeper.shared.authorization == .notDetermined {
+            step("vpn", "busy", "waiting for the location permission")
+            await LocationKeeper.shared.requestAndWait()
+            if aborted { return }
+            LocationKeeper.shared.start()   // now that the status is decided, actually start updates
+        }
+
         // 1. VPN
         step("vpn", "busy")
         if !VPNHelper.tunnelUp {
             if VPNHelper.installed {
+                vpnCallback = false
                 VPNHelper.open()
-                for _ in 0..<12 {
+                step("vpn", "busy", "waiting for LocalDev VPN")
+                // LocalDev VPN cold-launches, spawns its NE tunnel (1-4 s, longer after a reboot) and calls back
+                // after a fixed 1 s, possibly before the 10.7.x interface exists. Budget ~30 s, plus 10 s after the
+                // callback, and never give up while the user is still inside LocalDev VPN (app not active).
+                let started = Date()
+                var callbackSeenAt: Date?
+                while !VPNHelper.tunnelUp {
                     try? await Task.sleep(nanoseconds: 500_000_000)
                     if aborted { return }
                     if VPNHelper.tunnelUp { break }
+                    if vpnCallback, callbackSeenAt == nil { callbackSeenAt = Date() }
+                    let elapsed = Date().timeIntervalSince(started)
+                    if elapsed < 30 { continue }
+                    if let cb = callbackSeenAt, Date().timeIntervalSince(cb) < 10 { continue }
+                    if UIApplication.shared.applicationState != .active, elapsed < 600 { continue }
+                    break
                 }
             }
             guard VPNHelper.tunnelUp else {
@@ -138,25 +175,38 @@ final class SpoofEngine: ObservableObject {
         let kind = PairingStore.kind
         guard kind == PairingStore.remoteKind else {
             if kind == "none" {
-                fail("No pairing file yet.", hint: "Import the pairing file made on the PC (Settings → Pairing file).")
+                fail("No pairing file yet.", hint: "Ask for pairingFile.plist from the PC and import it (Settings → Pairing file). It is usually pushed to the phone for you.")
             } else {
-                fail("The pairing file is a \(kind) record.", hint: "This is a USB (lockdown) record. In idevice_pair choose Remote pairing, Save to file, and import that one.")
+                fail("The pairing file is a \(kind) record.", hint: "This file is the USB kind and won't work. Ask for a new Remote pairing file from the PC and import that one.")
             }
             return
         }
         step("pair", "done", kind)
 
         // 3. tunnel
-        step("tunnel", "busy")
+        step("tunnel", "busy", ffiBusy ? "waiting for the previous mount to finish" : "")
         let ip = settings.deviceIP, port = UInt16(clamping: settings.devicePort), path = PairingStore.url.path
-        let firstTunnel: DeviceTunnel
-        do {
-            firstTunnel = try await ffi { try DeviceTunnel.open(pairingPath: path, ip: ip, port: port) }
-        } catch {
-            if aborted { return }
-            fail("Tunnel failed: \(error.localizedDescription)", hint: tunnelHint(for: error))
-            return
+        var opened: DeviceTunnel?
+        // Two tries: the very first TCP connect to 10.7.0.1 can raise iOS's Local Network prompt (that attempt
+        // fails while the alert is up), and a reset right after the VPN came up is also transient.
+        for attempt in 1...2 {
+            do {
+                opened = try await ffi { try DeviceTunnel.open(pairingPath: path, ip: ip, port: port) }
+                break
+            } catch {
+                if aborted { return }
+                if attempt == 1 {
+                    AppLog.shared.add("tunnel attempt 1 failed (\(error.localizedDescription)); retrying")
+                    step("tunnel", "busy", "retrying")
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    if aborted { return }
+                    continue
+                }
+                fail("Tunnel failed: \(error.localizedDescription)", hint: tunnelHint(for: error))
+                return
+            }
         }
+        guard let firstTunnel = opened else { fail("Tunnel failed.", hint: nil); return }
         if aborted { await ffiRun { firstTunnel.close() }; return }
         step("tunnel", "done", "\(ip):\(port)")
         AppLog.shared.add("tunnel up via \(ip):\(port)")
@@ -183,10 +233,15 @@ final class SpoofEngine: ObservableObject {
                 }
                 step("ddi", "busy", "mounting (needs internet)")
                 DDIMounter.progress = { [weak self] f in self?.step("ddi", "busy", "mounting \(Int(f * 100))%") }
+                // The mount is a blocking, uncancellable FFI call that holds ffiQueue for the whole TSS + 16 MB
+                // upload; ffiBusy lets a Connect tapped after Cancel explain why its tunnel step waits.
+                ffiBusy = true
                 do {
                     try await ffi { try DDIMounter.mount(firstTunnel, image: DDIStore.image, trustCache: DDIStore.trustCache, manifest: DDIStore.manifest) }
+                    ffiBusy = false
                     AppLog.shared.add("developer image mounted")
                 } catch {
+                    ffiBusy = false
                     if aborted { await ffiRun { firstTunnel.close() }; return }
                     fail("Developer image could not be mounted: \(error.localizedDescription)", hint: "Check Developer Mode is on (Settings → Privacy & Security). The phone needs internet for this step (Apple signs the image). Or plug the phone into the PC once; Mirage mounts it there.")
                     await ffiRun { firstTunnel.close() }; return
@@ -194,11 +249,13 @@ final class SpoofEngine: ObservableObject {
                 if aborted { await ffiRun { firstTunnel.close() }; return }
             }
             // The RSD service list is captured at handshake time: reopen the tunnel so dtservicehub shows up.
-            // remoted can take a moment to republish the service, so retry the reopen a few times.
+            // remoted can take several seconds to republish the service after a fresh mount or a reboot (SideStore
+            // users routinely need a "force close and reopen" pause), so retry the reopen for ~15 s.
             await ffiRun { firstTunnel.close() }
             var reopened: DeviceTunnel?
             var lastError = "unknown"
-            for attempt in 1...3 {
+            let reopenAttempts = 10
+            for attempt in 1...reopenAttempts {
                 do {
                     let nt = try await ffi { try DeviceTunnel.open(pairingPath: path, ip: ip, port: port) }
                     if aborted { await ffiRun { nt.close() }; return }
@@ -211,12 +268,12 @@ final class SpoofEngine: ObservableObject {
                     if aborted { return }
                     lastError = error.localizedDescription
                 }
-                step("ddi", "busy", "waiting for the service (\(attempt)/3)")
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                step("ddi", "busy", "waiting for the service (\(attempt)/\(reopenAttempts))")
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
                 if aborted { return }
             }
             guard let nt = reopened else {
-                fail("The developer image is still not available (\(lastError)).", hint: "Reboot the phone, open LocalDev VPN, and try again on Wi-Fi with internet.")
+                fail("The developer image is still not available (\(lastError)).", hint: "Wait a few seconds and press Connect again; if it keeps failing, reboot the phone, open LocalDev VPN, and try again on Wi-Fi with internet.")
                 return
             }
             t = nt
@@ -248,12 +305,15 @@ final class SpoofEngine: ObservableObject {
         AppLog.shared.add("spoofing \(Geo.fmt(target))")
         armResend()
         if settings.jitter { armJitter() }
+        // A place picked while Connect was still running (Places tap, map "Go here") updated `position` but the
+        // channel was created with the target captured at connect(); push the newer point right away.
+        if position.latitude != target.latitude || position.longitude != target.longitude { send() }
     }
 
     private func tunnelHint(for error: Error) -> String {
         let e = error as? FFIError
-        if e?.code == -9 { return "The pairing file could not be read. Re-make it on the PC (idevice_pair → Remote pairing → Save to file) and import it again." }
-        if e?.isPairingRejected == true { return "The phone no longer accepts this pairing file. Plug the phone into the PC once, make a new Remote pairing file, and import it." }
+        if e?.code == -9 { return "The pairing file could not be read. Ask for a new Remote pairing file from the PC and import it again." }
+        if e?.isPairingRejected == true { return "The phone no longer accepts this pairing file. Plug the phone into the PC once so a new Remote pairing file can be made, then import it." }
         if !VPNHelper.tunnelUp { return "LocalDev VPN dropped. Open it, tap Connect, then try again." }
         return "Check Developer Mode is on (Settings → Privacy & Security). If iOS asked to allow local network access, tap Allow and press Connect again. Otherwise re-make the pairing file on the PC (plug in once) and import it again; make sure Wi-Fi is on, or Airplane Mode is on when you are on cellular."
     }
@@ -311,6 +371,8 @@ final class SpoofEngine: ObservableObject {
     // MARK: keep-alive + resend
 
     private func beginKeepAlive() {
+        // Asked here (first Connect, foreground, in context) rather than at launch; only used for "spoof dropped".
+        Notify.request()
         SilentAudioKeeper.shared.start()
         LocationKeeper.shared.start()
         if bgTask == .invalid {
@@ -342,7 +404,8 @@ final class SpoofEngine: ObservableObject {
         guard isActive else { return }
         resendTicks += 1
         if !VPNHelper.tunnelUp {
-            // Do not wait for the blocked set() to time out: the interface is gone, rebuild right away.
+            // The interface is gone: start the rebuild now instead of waiting for the next 4 s resend to notice.
+            // (A set() already in flight still has to return before ffiQueue can close the old handles; see linkLost.)
             linkLost("LocalDev VPN interface is gone")
             return
         }
@@ -381,11 +444,17 @@ final class SpoofEngine: ObservableObject {
         }
     }
 
+    /// Rebuilds the tunnel + channel after the link died. Keeps retrying (and keeps the audio/location keepers
+    /// running, so the app stays alive in the background) for up to 15 minutes: a locked phone can lose LocalDev
+    /// VPN for 20-60 s and get it back, and only the still-running app can resume the spoof then.
+    ///
+    /// The first close is queued on ffiQueue behind any send() that is still stuck in a write/read on the dead
+    /// tunnel; that call has to time out first. It is logged so the delay is explainable.
     private func linkLost(_ why: String) {
         guard isActive, !rebuilding, !stopping else { return }
         rebuilding = true
         AppLog.shared.add("link lost (\(why)); rebuilding")
-        let target = position
+        if sendInFlight { AppLog.shared.add("waiting for a stalled send to return before closing the old link") }
         resendTimer?.invalidate(); resendTimer = nil
         resetSendState()
         let ch = channel, t = tunnel
@@ -393,9 +462,13 @@ final class SpoofEngine: ObservableObject {
         rebuildTask = Task {
             await ffiRun { ch?.close(); t?.close() }
             var ok = false
-            for attempt in 1...3 {
+            var attempt = 0
+            let deadline = Date().addingTimeInterval(15 * 60)
+            while Date() < deadline {
                 if self.aborted { self.rebuilding = false; return }
                 if VPNHelper.tunnelUp, PairingStore.present {
+                    attempt += 1
+                    let target = self.position   // honour picks/travel that happened during the outage
                     var nt: DeviceTunnel?
                     do {
                         let opened = try await ffi { try DeviceTunnel.open(pairingPath: PairingStore.url.path, ip: self.settings.deviceIP, port: UInt16(clamping: self.settings.devicePort)) }
@@ -415,14 +488,16 @@ final class SpoofEngine: ObservableObject {
                         if self.aborted { self.rebuilding = false; return }
                     }
                 }
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                try? await Task.sleep(nanoseconds: UInt64(VPNHelper.tunnelUp ? 3 : 5) * 1_000_000_000)
             }
             self.rebuilding = false
             self.rebuildTask = nil
             if self.aborted { return }
             if ok {
+                self.lastSetAt = Date()
                 self.armResend()
             } else {
+                // Give up: only now do the keepers stop (the app will be suspended shortly after).
                 self.stopTimers(); self.stopTravel(); self.endKeepAlive()
                 self.phase = .idle
                 self.error = "Spoof dropped: \(why)"; self.hint = "Check LocalDev VPN is connected (Wi-Fi on, or Airplane Mode on cellular) and press Connect."
@@ -431,7 +506,21 @@ final class SpoofEngine: ObservableObject {
         }
     }
 
+    /// True when the last session ended with a drop the user has not dismissed yet.
+    var droppedAndIdle: Bool { phase == .idle && (error?.hasPrefix("Spoof dropped") ?? false) }
+
     func onForeground() {
+        // The app cannot open localdevvpn:// from the background; coming to the foreground is the one moment it can.
+        if rebuilding, !VPNHelper.tunnelUp, VPNHelper.installed {
+            AppLog.shared.add("foreground during rebuild: reopening LocalDev VPN")
+            VPNHelper.open()
+            return
+        }
+        if droppedAndIdle, Readiness.shared.allGood {
+            AppLog.shared.add("foreground after a drop: reconnecting")
+            connect()
+            return
+        }
         guard isActive else { return }
         send()
     }

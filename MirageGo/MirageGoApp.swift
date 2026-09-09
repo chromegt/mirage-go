@@ -8,7 +8,8 @@ struct MirageGoApp: App {
     init() {
         FFILogging.start()
         PairingStore.adoptFromDocuments()
-        Notify.request()
+        // Notification permission is asked on the first Connect (SpoofEngine.beginKeepAlive), in context, not here
+        // where it would land on top of the Setup sheet before the user knows what the app does.
     }
 
     var body: some Scene {
@@ -26,6 +27,10 @@ struct MirageGoApp: App {
                         defer { if ok { url.stopAccessingSecurityScopedResource() } }
                         do { try PairingStore.install(from: url); AppLog.shared.add("pairing file imported") }
                         catch { AppLog.shared.add("import failed: \(error.localizedDescription)") }
+                    } else if url.scheme?.lowercased() == "miragego" {
+                        // LocalDev VPN calls back a fixed 1 s after starting its tunnel; the engine uses it as a
+                        // wake-up (and grants the interface a few more seconds to appear).
+                        engine.vpnCallbackArrived()
                     }
                     Readiness.shared.refresh()
                 }
