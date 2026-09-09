@@ -131,7 +131,7 @@ final class LocationKeeper: NSObject, CLLocationManagerDelegate {
     /// alert was dismissed by an app switch). Returns immediately when the status is already determined.
     /// Call from the main actor while the app is in the foreground.
     @MainActor
-    func requestAndWait(timeout: TimeInterval = 30) async {
+    func requestAndWait(timeout: TimeInterval = 120) async {
         guard manager.authorizationStatus == .notDetermined else { return }
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             authWaiters.append(cont)
@@ -170,6 +170,10 @@ final class LocationKeeper: NSObject, CLLocationManagerDelegate {
 enum Notify {
     static func request() {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+    /// Same prompt, but suspends until it is answered (returns at once when the status is already decided).
+    static func requestAndWait() async {
+        _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
     }
     static func post(_ title: String, _ body: String) {
         let c = UNMutableNotificationContent()

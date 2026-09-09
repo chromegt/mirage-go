@@ -115,9 +115,11 @@ struct ContentView: View {
     @EnvironmentObject var ready: Readiness
     @State private var tab = 0
     @State private var showSetup = false
-    // Map camera lives here so switching tabs does not reset the user's zoom.
-    @State private var camera: MapCameraPosition = .automatic
-    @State private var didCenter = false
+    // Map camera lives here so switching tabs does not reset the user's zoom. It starts on the globe, centred on
+    // the last place, so the first frame is already the stage (no .automatic -> fly-in jump).
+    @State private var camera: MapCameraPosition = .camera(MapCamera(
+        centerCoordinate: CLLocationCoordinate2D(latitude: AppSettings.shared.lastLat, longitude: AppSettings.shared.lastLon),
+        distance: globeDistance, heading: 0, pitch: 0))
     // The bottom inset is keyboard-aware, so it would float above the keyboard while typing; hide it instead
     // (native tab bars stay under the keyboard). Not `.ignoresSafeArea(.keyboard)`: the Settings IP/Port fields
     // near the bottom of their scroll still need keyboard avoidance.
@@ -130,7 +132,7 @@ struct ContentView: View {
                 switch tab {
                 case 1: PlacesView(tab: $tab)
                 case 2: SettingsView(showSetup: $showSetup)
-                default: HomeView(tab: $tab, showSetup: $showSetup, camera: $camera, didCenter: $didCenter)
+                default: HomeView(tab: $tab, showSetup: $showSetup, camera: $camera)
                 }
             }
         }
@@ -146,9 +148,13 @@ struct ContentView: View {
                     if tab == 0 { PrimaryActionBar(showSetup: $showSetup) }
                     GlassTabBar(tab: $tab)
                 }
-                .padding(.top, 8)
+                .padding(.top, 16)
                 .background(
-                    LinearGradient(colors: [Theme.bg.opacity(0), Theme.bg.opacity(0.92)], startPoint: .top, endPoint: .center)
+                    LinearGradient(stops: [.init(color: Theme.bg.opacity(0), location: 0),
+                                           .init(color: Theme.bg.opacity(0.9), location: 0.35),
+                                           .init(color: Theme.bg.opacity(0.96), location: 1)],
+                                   startPoint: .top, endPoint: .bottom)
+                        .padding(.top, -24)   // the fade starts above the button, not at its edge
                         .ignoresSafeArea()
                         .allowsHitTesting(false)
                 )
@@ -157,20 +163,31 @@ struct ContentView: View {
         .sheet(isPresented: $showSetup) { SetupView().environmentObject(engine).environmentObject(ready) }
         .onAppear { if !ready.allGood && !UserDefaults.standard.bool(forKey: "setupSeen") { showSetup = true } }
         // Camera follow lives here (not in HomeView) so a pick made on the Places tab still recentres Home.
+        // A travel frames both ends; when it ends (arrival, stop, teleport) the camera settles on the position.
         .onChange(of: engine.travel) { _, tr in
-            guard let tr else { return }
-            withAnimation(.easeInOut(duration: 1.0)) { camera = .region(regionFitting([tr.from, tr.to])) }
+            withAnimation(.easeInOut(duration: 1.0)) {
+                camera = tr.map { MapCameraPosition.region(regionFitting([$0.from, $0.to])) } ?? stageCamera(engine.position, phase: engine.phase)
+            }
         }
-        .onChange(of: engine.positionName) { _, _ in
+        // Keyed on position + name so picking a second place with the same name still moves the camera.
+        .onChange(of: PlaceKey(engine.position, engine.positionName)) { _, _ in
             guard engine.travel == nil else { return }
             withAnimation(.easeInOut(duration: 1.2)) { camera = stageCamera(engine.position, phase: engine.phase) }
         }
         // The stage flies in from the globe when a session starts and back out when it ends.
         .onChange(of: engine.phase) { _, p in
             guard engine.travel == nil else { return }
-            withAnimation(.easeInOut(duration: 1.4)) { camera = stageCamera(engine.position, phase: p) }
+            withAnimation(.easeInOut(duration: 2.2)) { camera = stageCamera(engine.position, phase: p) }
         }
     }
+}
+
+/// Equatable key for the camera follow: the coordinate plus the name, so `onChange` fires on either.
+struct PlaceKey: Equatable {
+    let lat: Double
+    let lon: Double
+    let name: String
+    init(_ c: CLLocationCoordinate2D, _ n: String) { lat = c.latitude; lon = c.longitude; name = n }
 }
 
 /// The one button that matters, pinned above the tab bar so it is never below the fold.
@@ -196,12 +213,10 @@ struct PrimaryActionBar: View {
                     case .idle: engine.connect()
                     }
                 } label: {
-                    HStack(spacing: 8) {
-                        if engine.phase == .connecting { ProgressView().tint(.white).scaleEffect(0.8) }
-                        Text(engine.phase == .active ? "Disconnect" : engine.phase == .connecting ? "Cancel" : "Connect")
-                    }
+                    Text(engine.phase == .active ? "Disconnect" : engine.phase == .connecting ? "Cancel" : "Connect")
                 }
-                .buttonStyle(Button3D(dark: engine.phase != .idle))
+                // Disconnect is the red action while spoofing; Cancel stays the plain dark one.
+                .buttonStyle(Button3D(dark: engine.phase != .idle, danger: engine.phase == .active))
                 .accessibilityHint(engine.phase == .connecting ? "Stops the connection attempt" : "")
             }
         }
@@ -225,7 +240,7 @@ struct GlassTabBar: View {
                     }
                     .foregroundStyle(tab == i ? .white : Theme.dim)
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
+                    .padding(.vertical, 8)
                     .background(tab == i ? Color.white.opacity(0.1) : .clear)
                     .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 }
@@ -234,7 +249,7 @@ struct GlassTabBar: View {
                 .accessibilityAddTraits(tab == i ? [.isSelected] : [])
             }
         }
-        .padding(6)
+        .padding(5)
         .background(.ultraThinMaterial)
         .background(Theme.bg.opacity(0.6))
         .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(Theme.line, lineWidth: 1))
@@ -274,18 +289,17 @@ func regionFitting(_ pts: [CLLocationCoordinate2D]) -> MKCoordinateRegion {
 /// fights the page and the cards never cover it.
 struct HomeView: View {
     @EnvironmentObject var engine: SpoofEngine
-    @EnvironmentObject var settings: AppSettings
     @EnvironmentObject var ready: Readiness
     @EnvironmentObject var store: PlaceStore
     @ObservedObject var net = NetworkMonitor.shared
     @Binding var tab: Int
     @Binding var showSetup: Bool
     @Binding var camera: MapCameraPosition
-    @Binding var didCenter: Bool
     @State private var now = Date()
     @State private var pending: CLLocationCoordinate2D?
+    /// Tracks the live camera so the single zoom button knows which way to go.
+    @State private var zoomedOut = true
     @AppStorage("mapHintSeen") private var mapHintSeen = false
-    let clock = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     /// While the link is being rebuilt the phone shows its REAL location, so that state must not look like "Spoofing".
     var statusColor: Color {
@@ -299,7 +313,7 @@ struct HomeView: View {
         switch engine.phase {
         case .active: return engine.rebuilding ? "Reconnecting…" : "Spoofing"
         case .connecting: return "Connecting…"
-        case .idle: return "Real location"
+        case .idle: return ready.allGood ? "Not connected" : "Setup needed"
         }
     }
     /// Small caps pill copy; the session clock runs while spoofing.
@@ -310,7 +324,7 @@ struct HomeView: View {
             if let t = engine.connectedAt { return "SPOOFING · " + Geo.fmtClock(now.timeIntervalSince(t)) }
             return "SPOOFING"
         case .connecting: return "CONNECTING"
-        case .idle: return "REAL LOCATION"
+        case .idle: return ready.allGood ? "NOT CONNECTED" : "SETUP NEEDED"
         }
     }
     /// The stage takes the top ~46 % of the screen (never under 300 pt) and runs up under the status bar.
@@ -321,10 +335,12 @@ struct HomeView: View {
             stage.frame(height: stageHeight)
             ScrollView(showsIndicators: false) {
                 VStack(spacing: 14) {
-                    if !engine.steps.isEmpty { stepsCard.transition(.move(edge: .top).combined(with: .opacity)) }
+                    // The failure comes first; the step list under it says where it stopped. Steps are hidden once
+                    // the session is active (the engine clears them then anyway).
                     if let err = engine.error { errorCard(err).transition(.move(edge: .top).combined(with: .opacity)) }
+                    if !engine.steps.isEmpty && engine.phase != .active { stepsCard.transition(.move(edge: .top).combined(with: .opacity)) }
                     if engine.travel != nil { travelCard.transition(.opacity) }
-                    if net.cellularOnly && !ready.vpnUp && engine.phase != .active { cellularTip }
+                    if net.cellularOnly && !ready.vpnUp && engine.phase != .active { cellularTip.transition(.opacity) }
                     quickPlaces
                     locationCard
                     Color.clear.frame(height: 8)
@@ -333,11 +349,16 @@ struct HomeView: View {
                 .animation(.spring(duration: 0.4), value: engine.steps.isEmpty)
                 .animation(.spring(duration: 0.4), value: engine.error == nil)
                 .animation(.spring(duration: 0.4), value: engine.travel == nil)
+                .animation(.spring(duration: 0.4), value: engine.phase)
+                .animation(.easeOut(duration: 0.2), value: net.cellularOnly && !ready.vpnUp)
             }
         }
-        .onReceive(clock) { now = $0 }
-        .onAppear {
-            if !didCenter { camera = stageCamera(engine.position, phase: engine.phase); didCenter = true }
+        .task {
+            // Session clock / "last push" ticker; cancelled with the view.
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                now = Date()
+            }
         }
     }
 
@@ -348,14 +369,33 @@ struct HomeView: View {
             stageMap.ignoresSafeArea(edges: .top)
             // Scrims: a legible brand bar under the status bar, and a fade into the page so the cards sit on black.
             VStack(spacing: 0) {
-                LinearGradient(colors: [Theme.bg.opacity(0.85), .clear], startPoint: .top, endPoint: .bottom).frame(height: 120)
+                // 150 = ~59 safe area + 4 + 44 pill + ~40 of fade, so the bar is scrimmed on every device.
+                LinearGradient(stops: [.init(color: Theme.bg.opacity(0.75), location: 0),
+                                       .init(color: Theme.bg.opacity(0.4), location: 0.55),
+                                       .init(color: .clear, location: 1)],
+                               startPoint: .top, endPoint: .bottom)
+                    .frame(height: 150)
                 Spacer(minLength: 0)
-                LinearGradient(colors: [.clear, Theme.bg.opacity(0.72), Theme.bg], startPoint: .top, endPoint: .bottom).frame(height: 210)
+                LinearGradient(stops: [.init(color: .clear, location: 0),
+                                       .init(color: Theme.bg.opacity(0.55), location: 0.45),
+                                       .init(color: Theme.bg, location: 1)],
+                               startPoint: .top, endPoint: .bottom)
+                    .frame(height: max(170, stageHeight * 0.5))
             }
             .ignoresSafeArea(edges: .top)
             .allowsHitTesting(false)
             VStack(spacing: 0) {
                 brandBar
+                // One zoom toggle: the globe while zoomed in, the place while zoomed out.
+                HStack {
+                    Spacer()
+                    mapButton(zoomedOut ? "scope" : "globe.americas.fill", zoomedOut ? "Zoom to the place" : "Show the whole world") {
+                        withAnimation(.easeInOut(duration: 1.0)) {
+                            camera = .camera(MapCamera(centerCoordinate: engine.position, distance: zoomedOut ? cityDistance : globeDistance, heading: 0, pitch: 0))
+                        }
+                    }
+                }
+                .padding(.horizontal, 20).padding(.top, 10)
                 Spacer(minLength: 0)
                 stageFooter
             }
@@ -365,10 +405,10 @@ struct HomeView: View {
     var stageMap: some View {
         MapReader { proxy in
             Map(position: $camera, interactionModes: [.pan, .zoom]) {
-                Annotation("", coordinate: engine.position) { PulseDot(color: statusColor) }
+                Annotation("", coordinate: engine.position) { PulseDot(live: engine.phase != .idle) }
                 if let tr = engine.travel {
                     Annotation("", coordinate: tr.to) { Circle().fill(.white).frame(width: 12, height: 12).overlay(Circle().stroke(Theme.bg, lineWidth: 2)) }
-                    MapPolyline(coordinates: [engine.position, tr.to]).stroke(.white.opacity(0.8), style: StrokeStyle(lineWidth: 2, dash: [4, 6]))
+                    MapPolyline(coordinates: [engine.position, tr.to], contourStyle: .geodesic).stroke(.white.opacity(0.8), style: StrokeStyle(lineWidth: 2, dash: [4, 6]))
                 }
                 if let p = pending {
                     // Bottom anchor: the pin's tip sits on the tapped point, not its centre.
@@ -377,7 +417,11 @@ struct HomeView: View {
             }
             // Muted standard style = the monochrome world of the desktop app; realistic elevation gives the 3D globe.
             .mapStyle(.standard(elevation: .realistic, emphasis: .muted, pointsOfInterest: .excludingAll, showsTraffic: false))
+            .grayscale(1)   // the monochrome world; the annotations are drawn in white/black so they survive the filter
             .mapControlVisibility(.hidden)
+            .onMapCameraChange(frequency: .onEnd) { ctx in zoomedOut = ctx.camera.distance > 1_500_000 }
+            // A double-tap is the zoom gesture; registering it first keeps it from dropping a pin.
+            .onTapGesture(count: 2) { }
             .onTapGesture { pt in
                 // Drop a pin first; nothing moves until "Go here" is confirmed.
                 if let c = proxy.convert(pt, from: .local) {
@@ -425,24 +469,17 @@ struct HomeView: View {
                     VStack(alignment: .leading, spacing: 7) {
                         statusPill
                         Text(engine.travel?.name ?? engine.positionName)
-                            .font(.system(size: 34, weight: .bold, design: .rounded)).foregroundStyle(.white)
-                            .lineLimit(1).minimumScaleFactor(0.55)
+                            .font(.system(size: 32, weight: .bold, design: .rounded)).foregroundStyle(.white)
+                            .lineLimit(2).minimumScaleFactor(0.85)
                             .contentTransition(.opacity)
+                            .animation(.easeInOut(duration: 0.25), value: engine.travel?.name ?? engine.positionName)
                         Text(subline).font(.footnote).foregroundStyle(Theme.muted)
                             .lineLimit(2).fixedSize(horizontal: false, vertical: true)
                     }
-                    .allowsHitTesting(false)
-                    Spacer(minLength: 8)
-                    VStack(spacing: 8) {
-                        mapButton("globe.americas.fill", "Show the whole world") {
-                            withAnimation(.easeInOut(duration: 1.0)) { camera = .camera(MapCamera(centerCoordinate: engine.position, distance: globeDistance, heading: 0, pitch: 0)) }
-                        }
-                        mapButton("scope", "Zoom to the place") {
-                            withAnimation(.easeInOut(duration: 1.0)) { camera = .camera(MapCamera(centerCoordinate: engine.position, distance: cityDistance, heading: 0, pitch: 0)) }
-                        }
-                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .padding(.horizontal, 20).padding(.bottom, 12)
+                .contentShape(Rectangle())   // taps on the text band must never fall through and drop a pin
                 .transition(.opacity)
             }
         }
@@ -476,26 +513,36 @@ struct HomeView: View {
         .accessibilityLabel(label)
     }
 
+    /// Same rhythm as the normal footer (pill, headline, detail) so the stage does not jump when a pin drops.
     func pendingBar(_ p: CLLocationCoordinate2D) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("Pin dropped", systemImage: "mappin").font(.caption.weight(.bold)).foregroundStyle(.white)
+        VStack(alignment: .leading, spacing: 7) {
+            statusPill
+            Text("Dropped pin")
+                .font(.system(size: 32, weight: .bold, design: .rounded)).foregroundStyle(.white)
+                .lineLimit(2).minimumScaleFactor(0.85)
             Text(Geo.fmt(p)).font(.footnote.monospacedDigit()).foregroundStyle(Theme.muted)
             HStack(spacing: 8) {
                 // Same behaviour as a Places tap: when idle and set up, "Go here" actually connects.
                 Button(ready.allGood || engine.phase != .idle ? "Go here" : "Pick here") {
                     UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                    engine.pick(p, name: "Custom point")
+                    engine.pick(p, name: "Dropped pin")
                     pending = nil
                     if engine.phase == .idle && ready.allGood { engine.connect() }
+                    // Give the pin a real name when the phone is online; skipped if the user has moved on since.
+                    // While travelling the pin is the destination, so rename the travel (arrival copies its name).
+                    Task {
+                        if let pm = try? await CLGeocoder().reverseGeocodeLocation(CLLocation(latitude: p.latitude, longitude: p.longitude)).first,
+                           let n = pm.name ?? pm.locality,
+                           Geo.distance(engine.travel?.to ?? engine.position, p) < 2 {
+                            if engine.travel != nil { engine.travel?.name = n } else { engine.positionName = n }
+                            AppSettings.shared.lastName = n
+                        }
+                    }
                 }
                 .buttonStyle(Button3D(compact: true))
-                Button { withAnimation(.easeOut(duration: 0.15)) { pending = nil } } label: {
-                    Image(systemName: "xmark").font(.callout.weight(.semibold)).foregroundStyle(.white)
-                        .frame(width: 44, height: 44).background(.ultraThinMaterial).clipShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Remove pin")
+                mapButton("xmark", "Remove pin") { withAnimation(.easeOut(duration: 0.15)) { pending = nil } }
             }
+            .padding(.top, 2)
         }
         .padding(.horizontal, 20).padding(.bottom, 12)
         .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -520,20 +567,28 @@ struct HomeView: View {
 
     /// One-tap destinations: favourites first, then the presets. Same behaviour as a tap on the Places tab.
     var quickPlaces: some View {
-        let list = store.places.sorted { ($0.fav ? 0 : 1, $0.name) < ($1.fav ? 0 : 1, $1.name) }
+        // Favourites first, then most recently used, then by name.
+        let list = store.places.sorted { ($0.fav ? 0 : 1, -($0.used ?? 0), $0.name) < ($1.fav ? 0 : 1, -($1.used ?? 0), $1.name) }
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text("QUICK PLACES").font(.caption.weight(.semibold)).foregroundStyle(Theme.header)
                 Spacer()
-                Button("All places") { tab = 1 }.font(.caption.weight(.semibold)).foregroundStyle(Theme.muted)
+                Button { tab = 1 } label: {
+                    HStack(spacing: 3) {
+                        Text("All places")
+                        Image(systemName: "chevron.right").font(.caption2.weight(.bold))
+                    }
+                    .font(.caption.weight(.semibold)).foregroundStyle(Theme.muted)
+                }
             }
-            .padding(.horizontal, 24)
+            .padding(.horizontal, 30)
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
                     ForEach(list) { p in
                         let selected = Geo.distance(engine.position, p.coordinate) < 2
                         Button {
                             UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                            store.touch(p)
                             engine.pick(p.coordinate, name: p.name)
                             if engine.phase == .idle && ready.allGood { engine.connect() }
                         } label: {
@@ -541,7 +596,7 @@ struct HomeView: View {
                                 Text(p.icon).font(.body)
                                 Text(p.name).font(.subheadline.weight(.semibold)).foregroundStyle(selected ? .black : .white).lineLimit(1)
                             }
-                            .padding(.horizontal, 12).padding(.vertical, 9)
+                            .padding(.horizontal, 14).padding(.vertical, 9)
                             .background(selected ? Color.white : Theme.card)
                             .overlay(Capsule().stroke(selected ? Color.white : Theme.line, lineWidth: 1))
                             .clipShape(Capsule())
@@ -559,7 +614,7 @@ struct HomeView: View {
         Card {
             VStack(alignment: .leading, spacing: 9) {
                 HStack {
-                    Text("CONNECTING").font(.caption.weight(.semibold)).foregroundStyle(Theme.header)
+                    Text(engine.phase == .connecting ? "CONNECTING" : "STOPPED").font(.caption.weight(.semibold)).foregroundStyle(Theme.header)
                     Spacer()
                     Text("\(engine.steps.filter { $0.status == "done" }.count)/\(engine.steps.count)").font(.caption.monospacedDigit()).foregroundStyle(Theme.dim)
                 }
@@ -605,13 +660,15 @@ struct HomeView: View {
     }
 
     func errorCard(_ err: String) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let failed = engine.steps.first { $0.status == "fail" }
+        return VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .top, spacing: 8) {
                 Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Theme.danger)
                 // The human hint is the headline; the raw engine string is the detail.
-                Text(engine.hint ?? err).font(.footnote.weight(.semibold)).fixedSize(horizontal: false, vertical: true)
+                Text(engine.hint ?? err).font(.subheadline).foregroundStyle(.white).fixedSize(horizontal: false, vertical: true)
             }
-            if engine.hint != nil { Text(err).font(.caption2).foregroundStyle(Theme.dim).textSelection(.enabled) }
+            if engine.hint != nil { Text(err).font(.footnote).foregroundStyle(Theme.muted).textSelection(.enabled) }
+            if let failed { Text("Stopped at: " + failed.label).font(.caption).foregroundStyle(Theme.dim) }
             HStack {
                 Button("Setup checklist") { showSetup = true }
                     .font(.footnote.weight(.semibold)).foregroundStyle(.white)
@@ -635,56 +692,59 @@ struct HomeView: View {
                 Image(systemName: "airplane").foregroundStyle(Theme.warn)
                 VStack(alignment: .leading, spacing: 3) {
                     Text("On cellular only").font(.subheadline.weight(.semibold))
-                    Text("Turn Airplane Mode on, connect LocalDev VPN, press Connect, then turn cellular back on (leave Airplane Mode on).").font(.caption).foregroundStyle(Theme.muted)
+                    Text("Turn Airplane Mode on, connect LocalDev VPN, press Connect, then turn cellular back on (leave Airplane Mode on).").font(.footnote).lineSpacing(2).foregroundStyle(Theme.muted)
                 }
             }
         }
         .padding(.horizontal, 16)
     }
 
+    /// The exact coordinates (the name is already the headline on the stage).
     var locationCard: some View {
         Card {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 12) {
-                    Text(placeIcon).font(.title2).frame(width: 44, height: 44).background(Theme.card2).clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(engine.isActive ? "Simulated location" : "Next place").font(.caption).foregroundStyle(Theme.muted)
-                        Text(engine.positionName).font(.headline).lineLimit(1)
-                        Text(Geo.fmt(engine.position)).font(.footnote.monospacedDigit()).foregroundStyle(Theme.muted)
-                    }
-                    Spacer(minLength: 8)
-                    Button("Change") { tab = 1 }.buttonStyle(Button3D(dark: true, compact: true)).frame(width: 96)
-                }
-                // Only while something is running; when idle the error card's Dismiss is the right control.
-                if engine.phase != .idle {
-                    Button {
-                        UINotificationFeedbackGenerator().notificationOccurred(.warning)
-                        engine.kill()
-                    } label: { Label("Stop & restore real location", systemImage: "stop.fill") }
-                    .buttonStyle(Button3D(dark: true, danger: true, compact: true))
+            HStack(spacing: 12) {
+                Image(systemName: "location.fill").font(.callout).foregroundStyle(Theme.muted).frame(width: 28)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Coordinates").font(.caption).foregroundStyle(Theme.muted)
+                    Text(Geo.fmt(engine.position)).font(.subheadline.monospacedDigit())
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.horizontal, 16)
     }
 
-    var placeIcon: String { store.places.first { Geo.distance($0.coordinate, engine.position) < 2 }?.icon ?? "📍" }
     func stepColor(_ s: String) -> Color { s == "done" ? Theme.ok : s == "busy" ? Theme.warn : s == "fail" ? Theme.danger : Theme.dim }
 }
 
+/// The position marker. Deliberately monochrome: the map is under `.grayscale(1)`, so any colour here would be
+/// desaturated anyway; the status colour lives in the pill and the brand bar instead.
 struct PulseDot: View {
-    let color: Color
+    /// The rings only pulse while a session is running; idle is a plain marker.
+    var live: Bool = true
+    var body: some View {
+        ZStack {
+            if live { PulseRings() }
+            Circle().fill(.white).frame(width: 14, height: 14)
+                .overlay(Circle().stroke(Theme.bg, lineWidth: 3))
+                .shadow(color: .black.opacity(0.6), radius: 6)
+        }
+    }
+}
+
+/// Own view so its @State is created fresh each time the rings are inserted: the animation starts from the
+/// collapsed state on every Connect instead of being stuck at its end state.
+struct PulseRings: View {
     @State private var pulse = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var body: some View {
         ZStack {
-            Circle().fill(color.opacity(0.35)).frame(width: 50, height: 50).scaleEffect(pulse ? 1.7 : 0.5).opacity(pulse ? 0 : 0.7)
-            Circle().fill(color.opacity(0.35)).frame(width: 50, height: 50).scaleEffect(pulse ? 1.2 : 0.4).opacity(pulse ? 0 : 0.5)
-            Circle().fill(.white).frame(width: 14, height: 14).overlay(Circle().stroke(color, lineWidth: 3)).shadow(color: color, radius: 8)
+            Circle().fill(.white.opacity(0.35)).frame(width: 50, height: 50).scaleEffect(pulse ? 1.7 : 0.5).opacity(pulse ? 0 : 0.7)
+                .animation(.easeOut(duration: 2.2).repeatForever(autoreverses: false), value: pulse)
+            Circle().fill(.white.opacity(0.35)).frame(width: 50, height: 50).scaleEffect(pulse ? 1.2 : 0.4).opacity(pulse ? 0 : 0.5)
+                .animation(.easeOut(duration: 2.2).repeatForever(autoreverses: false).delay(1.1), value: pulse)
         }
-        .onAppear {
-            if !reduceMotion { withAnimation(.easeOut(duration: 2.2).repeatForever(autoreverses: false)) { pulse = true } }
-        }
+        .onAppear { if !reduceMotion { pulse = true } }
     }
 }
 
@@ -757,7 +817,7 @@ struct PlacesView: View {
                     if !alreadySaved {
                         Button {
                             let n = engine.travel?.name ?? engine.positionName
-                            newName = n == "Custom point" ? "" : n
+                            newName = Geo.isGeneric(n) ? "" : n
                             naming = true
                         } label: {
                             Label("Save map point", systemImage: "plus")
@@ -797,7 +857,7 @@ struct PlacesView: View {
                 if let lat = Double(latText.trimmingCharacters(in: .whitespaces)), let lon = Double(lonText.trimmingCharacters(in: .whitespaces)),
                    (-90...90).contains(lat), (-180...180).contains(lon) {
                     latText = ""; lonText = ""; searchError = nil
-                    go(CLLocationCoordinate2D(latitude: lat, longitude: lon), name: "Custom point")
+                    go(CLLocationCoordinate2D(latitude: lat, longitude: lon), name: "Typed coordinates")
                 } else {
                     // Keep what was typed and re-open the dialog with the message in it, instead of surfacing the
                     // error in the search card after the dialog has closed.
@@ -885,12 +945,12 @@ struct PlacesView: View {
 
     func section(_ title: String, _ items: [Place]) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(title.uppercased()).font(.caption.weight(.semibold)).foregroundStyle(Theme.header).padding(.horizontal, 24)
+            Text(title.uppercased()).font(.caption.weight(.semibold)).foregroundStyle(Theme.header).padding(.horizontal, 30)
             VStack(spacing: 0) {
                 ForEach(items) { p in
                     let selected = Geo.distance(engine.position, p.coordinate) < 2
                     HStack(spacing: 12) {
-                        Text(p.icon).font(.title3).frame(width: 40, height: 34).background(Theme.card2).clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                        Text(p.icon).font(.title3).frame(width: 36, height: 36).background(Theme.card2).clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                         VStack(alignment: .leading, spacing: 2) {
                             Text(p.name).font(.subheadline.weight(.semibold)).foregroundStyle(.white)
                             Text(Geo.fmt(p.coordinate)).font(.caption.monospacedDigit()).foregroundStyle(Theme.dim)
@@ -911,7 +971,7 @@ struct PlacesView: View {
                     .padding(.horizontal, 12).padding(.vertical, 6)
                     .background(selected ? Color.white.opacity(0.06) : .clear)
                     .contentShape(Rectangle())
-                    .onTapGesture { go(p.coordinate, name: p.name) }
+                    .onTapGesture { store.touch(p); go(p.coordinate, name: p.name) }
                     .contextMenu {
                         Button { withAnimation { store.toggleFav(p) } } label: { Label(p.fav ? "Unfavourite" : "Favourite", systemImage: "star") }
                         if p.custom {
@@ -936,6 +996,19 @@ func isIPv4(_ s: String) -> Bool {
     return s.withCString { inet_pton(AF_INET, $0, &tmp) } == 1
 }
 
+/// Small capsule for secondary row actions (open, copy, reset); the 3D button stays for the primary ones.
+struct RowAction: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.footnote.weight(.semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 12).padding(.vertical, 7)
+            .background(Theme.card2)
+            .clipShape(Capsule())
+            .opacity(configuration.isPressed ? 0.6 : 1)
+    }
+}
+
 struct SettingsView: View {
     enum Field: Hashable { case ip, port }
 
@@ -955,7 +1028,7 @@ struct SettingsView: View {
 
     var body: some View {
         ScrollView(showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 14) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Settings").font(.largeTitle.bold())
                     Text("Changes apply right away.").font(.footnote).foregroundStyle(Theme.muted)
@@ -981,7 +1054,7 @@ struct SettingsView: View {
                     Group {
                         statusRow("LocalDev VPN", ready.vpnUp ? "Connected" : ready.vpnInstalled ? "Installed, not connected" : "Not installed", ready.vpnUp ? Theme.ok : Theme.warn)
                         Button(ready.vpnInstalled ? "Open LocalDev VPN" : "Get LocalDev VPN") { if ready.vpnInstalled { VPNHelper.open() } else { VPNHelper.openStore() } }
-                            .buttonStyle(Button3D(dark: true, compact: true))
+                            .buttonStyle(RowAction())
                     }
                     Group {
                         statusRow("Pairing file", ready.pairing ? "Imported (\(ready.pairingKind))" : ready.pairingKind == "none" ? "Missing" : "Wrong kind: \(ready.pairingKind)", ready.pairing ? Theme.ok : Theme.warn)
@@ -992,7 +1065,7 @@ struct SettingsView: View {
                         if importOK {
                             Label("Pairing file imported", systemImage: "checkmark.circle.fill").font(.caption.weight(.semibold)).foregroundStyle(Theme.ok)
                         }
-                        Text("Or drop pairingFile.plist into the Mirage Go folder (Files app or Apple Devices file sharing); it is picked up automatically.").font(.caption).foregroundStyle(Theme.dim)
+                        Text("Or drop pairingFile.plist into the Mirage Go folder (Files app or Apple Devices file sharing); it is picked up automatically.").font(.footnote).lineSpacing(2).foregroundStyle(Theme.dim)
                     }
                     Group {
                         statusRow("Developer image", ready.ddiFiles ? (engine.ddiStatus == "mounted" ? "Ready · mounted" : "Files ready") : "Not downloaded yet", ready.ddiFiles ? Theme.ok : Theme.warn)
@@ -1017,11 +1090,15 @@ struct SettingsView: View {
                                 .buttonStyle(Button3D(compact: true))
                         }
                         if ready.locationAuth != .authorizedAlways {
-                            Button("Open iOS Settings") { if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) } }
-                                .buttonStyle(Button3D(dark: true, compact: true))
-                            Text("Set Location to Always so the spoof keeps running when the phone is locked.").font(.caption).foregroundStyle(Theme.dim)
+                            Text("Set Location to Always so the spoof keeps running when the phone is locked.").font(.footnote).lineSpacing(2).foregroundStyle(Theme.dim)
                         }
-                        Button("Setup checklist") { showSetup = true }.buttonStyle(Button3D(compact: true))
+                        HStack(spacing: 8) {
+                            if ready.locationAuth != .authorizedAlways {
+                                Button("Open iOS Settings") { if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) } }
+                                    .buttonStyle(RowAction())
+                            }
+                            Button("Setup checklist") { showSetup = true }.buttonStyle(RowAction())
+                        }
                     }
                 }
 
@@ -1042,8 +1119,8 @@ struct SettingsView: View {
                         settings.deviceIP = "10.7.0.1"; settings.devicePort = 49152
                         ipText = settings.deviceIP; portText = String(settings.devicePort); focus = nil
                     }
-                    .buttonStyle(Button3D(dark: true, compact: true))
-                    Text("Leave these unless LocalDev VPN tells you otherwise. Cellular only: Airplane Mode on → connect the VPN → Connect → cellular back on.").font(.caption).foregroundStyle(Theme.dim)
+                    .buttonStyle(RowAction())
+                    Text("Leave these unless LocalDev VPN tells you otherwise. Cellular only: Airplane Mode on → connect the VPN → Connect → cellular back on.").font(.footnote).lineSpacing(2).foregroundStyle(Theme.dim)
                 }
 
                 group("Log") {
@@ -1061,12 +1138,12 @@ struct SettingsView: View {
                         .onAppear { proxy.scrollTo("end", anchor: .bottom) }
                         .onChange(of: log.lines.count) { _, _ in proxy.scrollTo("end", anchor: .bottom) }
                     }
-                    Button("Copy log") { UIPasteboard.general.string = log.lines.joined(separator: "\n"); UINotificationFeedbackGenerator().notificationOccurred(.success) }.buttonStyle(Button3D(dark: true, compact: true))
+                    Button("Copy log") { UIPasteboard.general.string = log.lines.joined(separator: "\n"); UINotificationFeedbackGenerator().notificationOccurred(.success) }.buttonStyle(RowAction())
                 }
 
                 group("About") {
                     statusRow("Mirage Go", Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "", Theme.muted)
-                    Text("Only changes what this iPhone reports. It uses Apple's developer location service through LocalDev VPN; nothing is jailbroken and nothing leaves the phone.").font(.caption).foregroundStyle(Theme.dim)
+                    Text("Only changes what this iPhone reports. It uses Apple's developer location service through LocalDev VPN; nothing is jailbroken and nothing leaves the phone.").font(.footnote).lineSpacing(2).foregroundStyle(Theme.dim)
                 }
                 Color.clear.frame(height: 8)
             }
@@ -1122,7 +1199,7 @@ struct SettingsView: View {
 
     func group<Content: View>(_ title: String, @ViewBuilder _ content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(title.uppercased()).font(.caption.weight(.semibold)).foregroundStyle(Theme.header).padding(.horizontal, 24)
+            Text(title.uppercased()).font(.caption.weight(.semibold)).foregroundStyle(Theme.header).padding(.horizontal, 30)
             Card { VStack(alignment: .leading, spacing: 10) { content() } }.padding(.horizontal, 16)
         }
     }
@@ -1131,7 +1208,7 @@ struct SettingsView: View {
         Toggle(isOn: isOn) {
             VStack(alignment: .leading, spacing: 2) { Text(title).font(.subheadline.weight(.semibold)); Text(desc).font(.caption).foregroundStyle(Theme.muted) }
         }
-        .tint(Color(white: 0.62))
+        .tint(Color(white: 0.8))
     }
 
     func statusRow(_ k: String, _ v: String, _ c: Color) -> some View {
@@ -1189,7 +1266,7 @@ struct SetupView: View {
                             Image(systemName: "wifi").foregroundStyle(Theme.warn)
                             VStack(alignment: .leading, spacing: 3) {
                                 Text("Do the first Connect on Wi-Fi").font(.subheadline.weight(.semibold))
-                                Text("Tap Allow when the phone asks about the local network and choose Always for location. No Wi-Fi later? Airplane Mode on → LocalDev VPN Connect → Mirage Go Connect → cellular back on (leave Airplane Mode on).").font(.caption).foregroundStyle(Theme.muted)
+                                Text("Tap Allow when the phone asks about the local network and choose Always for location. No Wi-Fi later? Airplane Mode on → LocalDev VPN Connect → Mirage Go Connect → cellular back on (leave Airplane Mode on).").font(.footnote).lineSpacing(2).foregroundStyle(Theme.muted)
                             }
                         }
                     }
@@ -1232,7 +1309,7 @@ struct SetupView: View {
                 }
                 VStack(alignment: .leading, spacing: 6) {
                     Text(title).font(.headline)
-                    Text(desc).font(.caption).foregroundStyle(Theme.muted)
+                    Text(desc).font(.footnote).lineSpacing(2).foregroundStyle(Theme.muted)
                     if let e = error {
                         Label(e, systemImage: "exclamationmark.triangle.fill").font(.caption.weight(.semibold)).foregroundStyle(Theme.danger)
                     }

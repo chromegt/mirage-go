@@ -39,6 +39,14 @@ final class SpoofEngine: ObservableObject {
     private var stopping = false
     private var connectTask: Task<Void, Never>?
     private var rebuildTask: Task<Void, Never>?
+    /// Stamp for the current rebuild attempt; a rebuild task that outlived a disconnect/teardown must not clear the
+    /// state of a newer session.
+    private var rebuildGen = 0
+    private func rebuildEnded(_ gen: Int) {
+        guard gen == rebuildGen else { return }
+        rebuilding = false
+        rebuildTask = nil
+    }
     /// True while the link is being rebuilt after a drop. The channel is closed for that whole window, so the phone
     /// shows its REAL location; the UI renders this as a distinct warning state, not as "Spoofing".
     @Published private(set) var rebuilding = false
@@ -67,7 +75,6 @@ final class SpoofEngine: ObservableObject {
     // MARK: picking
 
     func pick(_ c: CLLocationCoordinate2D, name: String) {
-        settings.lastLat = c.latitude; settings.lastLon = c.longitude; settings.lastName = name
         if isActive && settings.travel && Geo.distance(position, c) > 3 {
             startTravel(to: c, name: name)
         } else {
@@ -75,6 +82,8 @@ final class SpoofEngine: ObservableObject {
             position = c; positionName = name
             if isActive { send() }
         }
+        // Saved last: stopTravel() records the cut-short point, and the pick must win over that.
+        settings.lastLat = c.latitude; settings.lastLon = c.longitude; settings.lastName = name
     }
 
     // MARK: connect / disconnect
@@ -83,6 +92,7 @@ final class SpoofEngine: ObservableObject {
         guard phase == .idle else { return }
         stopping = false
         error = nil; hint = nil
+        connectedAt = nil
         resetSendState()
         phase = .connecting
         steps = [Step(id: "vpn", label: "LocalDev VPN", status: "todo"), Step(id: "pair", label: "Pairing file", status: "todo"),
@@ -141,6 +151,10 @@ final class SpoofEngine: ObservableObject {
             if aborted { return }
             LocationKeeper.shared.start()   // now that the status is decided, actually start updates
         }
+        // The notification prompt (only used for "spoof dropped") is asked here, in the foreground, after the
+        // location prompt and before the VPN app-switch, so the two alerts never stack.
+        await Notify.requestAndWait()
+        if aborted { return }
 
         // 1. VPN
         step("vpn", "busy")
@@ -303,6 +317,7 @@ final class SpoofEngine: ObservableObject {
         tunnel = tunnelForChannel
         connectTask = nil
         phase = .active
+        steps = []
         lastSetAt = Date()
         connectedAt = Date()
         UINotificationFeedbackGenerator().notificationOccurred(.success)
@@ -326,6 +341,7 @@ final class SpoofEngine: ObservableObject {
         stopping = true
         connectTask?.cancel(); connectTask = nil
         rebuildTask?.cancel(); rebuildTask = nil
+        rebuildGen += 1
         rebuilding = false
         stopTravel()
         stopTimers()
@@ -354,6 +370,7 @@ final class SpoofEngine: ObservableObject {
 
     private func teardownHandles() {
         rebuildTask?.cancel(); rebuildTask = nil
+        rebuildGen += 1
         rebuilding = false
         resetSendState()
         let ch = channel, t = tunnel
@@ -376,8 +393,6 @@ final class SpoofEngine: ObservableObject {
     // MARK: keep-alive + resend
 
     private func beginKeepAlive() {
-        // Asked here (first Connect, foreground, in context) rather than at launch; only used for "spoof dropped".
-        Notify.request()
         SilentAudioKeeper.shared.start()
         LocationKeeper.shared.start()
         if bgTask == .invalid {
@@ -464,13 +479,16 @@ final class SpoofEngine: ObservableObject {
         resetSendState()
         let ch = channel, t = tunnel
         channel = nil; tunnel = nil
+        rebuildGen += 1
+        let gen = rebuildGen
         rebuildTask = Task {
             await ffiRun { ch?.close(); t?.close() }
             var ok = false
             var attempt = 0
+            var sent: CLLocationCoordinate2D?
             let deadline = Date().addingTimeInterval(15 * 60)
             while Date() < deadline {
-                if self.aborted { self.rebuilding = false; return }
+                if self.aborted { self.rebuildEnded(gen); return }
                 if VPNHelper.tunnelUp, PairingStore.present {
                     attempt += 1
                     let target = self.position   // honour picks/travel that happened during the outage
@@ -478,34 +496,37 @@ final class SpoofEngine: ObservableObject {
                     do {
                         let opened = try await ffi { try DeviceTunnel.open(pairingPath: PairingStore.url.path, ip: self.settings.deviceIP, port: UInt16(clamping: self.settings.devicePort)) }
                         nt = opened
-                        if self.aborted { await ffiRun { opened.close() }; self.rebuilding = false; return }
+                        if self.aborted { await ffiRun { opened.close() }; self.rebuildEnded(gen); return }
                         let nc = try await ffi { let c = try LocationChannel(tunnel: opened); try c.set(lat: target.latitude, lon: target.longitude); return c }
-                        if self.aborted { await ffiRun { nc.close(); opened.close() }; self.rebuilding = false; return }
+                        if self.aborted { await ffiRun { nc.close(); opened.close() }; self.rebuildEnded(gen); return }
                         self.closeHandles(self.channel, self.tunnel)
                         self.channel = nc
                         self.tunnel = opened
                         ok = true
+                        sent = target
                         AppLog.shared.add("rebuilt on attempt \(attempt)")
                         break
                     } catch {
                         AppLog.shared.add("rebuild \(attempt): \(error.localizedDescription)")
                         if let nt { await ffiRun { nt.close() } }
-                        if self.aborted { self.rebuilding = false; return }
+                        if self.aborted { self.rebuildEnded(gen); return }
                     }
                 }
                 try? await Task.sleep(nanoseconds: UInt64(VPNHelper.tunnelUp ? 3 : 5) * 1_000_000_000)
             }
-            self.rebuilding = false
-            self.rebuildTask = nil
+            self.rebuildEnded(gen)
             if self.aborted { return }
             if ok {
                 self.lastSetAt = Date()
                 self.armResend()
+                // A pick/travel tick that landed between the channel's first set() and now must not be lost.
+                if let s = sent, s.latitude != self.position.latitude || s.longitude != self.position.longitude { self.send() }
             } else {
                 // Give up: only now do the keepers stop (the app will be suspended shortly after).
                 self.stopTimers(); self.stopTravel(); self.endKeepAlive()
                 self.phase = .idle
                 self.connectedAt = nil
+                self.steps = []
                 self.error = "Spoof dropped: \(why)"; self.hint = "Check LocalDev VPN is connected (Wi-Fi on, or Airplane Mode on cellular) and press Connect."
                 Notify.post("Mirage Go stopped", "The spoof dropped. Open Mirage Go to reconnect.")
             }
@@ -522,7 +543,7 @@ final class SpoofEngine: ObservableObject {
             VPNHelper.open()
             return
         }
-        if droppedAndIdle, Readiness.shared.allGood {
+        if droppedAndIdle, Readiness.shared.allGood, Readiness.shared.vpnUp {
             AppLog.shared.add("foreground after a drop: reconnecting")
             connect()
             return
@@ -555,6 +576,8 @@ final class SpoofEngine: ObservableObject {
         if frac >= 1 {
             positionName = tr.name
             stopTravel()
+            // A pick made mid-travel restarted the travel via stopTravel(), which saved "On the way"; the arrival wins.
+            settings.lastLat = tr.to.latitude; settings.lastLon = tr.to.longitude; settings.lastName = tr.name
             send()
             AppLog.shared.add("arrived")
         }
@@ -564,11 +587,19 @@ final class SpoofEngine: ObservableObject {
         guard let tr = travel else { return }
         stopTravel()
         position = tr.to; positionName = tr.name
+        // stopTravel() just saved the interpolated point as "On the way"; the destination is where we ended up.
+        settings.lastLat = tr.to.latitude; settings.lastLon = tr.to.longitude; settings.lastName = tr.name
         send()
     }
 
     func stopTravel() {
         travelTimer?.invalidate(); travelTimer = nil
+        // Cut short: the marker sits on an interpolated road point, so the name must not stay the origin's.
+        // Before the first tick the marker is still exactly at the origin, and that name is still right.
+        if let tr = travel, travelProgress < 1, Geo.distance(position, tr.from) > 2 {
+            positionName = "On the way"
+            settings.lastLat = position.latitude; settings.lastLon = position.longitude; settings.lastName = positionName
+        }
         travel = nil
         travelProgress = 0
     }

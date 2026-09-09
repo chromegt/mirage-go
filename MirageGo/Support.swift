@@ -229,6 +229,10 @@ enum Geo {
         return CLLocationCoordinate2D(latitude: p2 * 180 / .pi, longitude: l2 * 180 / .pi)
     }
     static func fmt(_ c: CLLocationCoordinate2D) -> String { String(format: "%.5f, %.5f", c.latitude, c.longitude) }
+    /// Placeholder names the engine assigns itself (not places the user named).
+    // "Custom point" stays so an already-saved lastName from an older build still counts as generic.
+    static let genericNames: Set<String> = ["Custom point", "Typed coordinates", "Dropped pin", "On the way"]
+    static func isGeneric(_ n: String) -> Bool { genericNames.contains(n) }
     /// Session clock: m:ss under an hour, h:mm:ss after.
     static func fmtClock(_ s: Double) -> String {
         let t = Int(max(0, s))
@@ -252,6 +256,8 @@ struct Place: Identifiable, Codable, Equatable {
     var icon: String
     var fav: Bool = false
     var custom: Bool = false
+    /// Last time the place was picked (seconds since 1970); orders the Quick Places row.
+    var used: Double? = nil
     var coordinate: CLLocationCoordinate2D { CLLocationCoordinate2D(latitude: lat, longitude: lon) }
 }
 
@@ -286,9 +292,12 @@ final class PlaceStore: ObservableObject {
         if let i = places.firstIndex(where: { $0.id == p.id }) { places[i].fav.toggle() }
     }
     func add(name: String, at c: CLLocationCoordinate2D, icon: String) {
-        places.insert(Place(id: "c-\(Int(Date().timeIntervalSince1970))", name: name, lat: c.latitude, lon: c.longitude, icon: icon, fav: true, custom: true), at: 0)
+        places.insert(Place(id: UUID().uuidString, name: name, lat: c.latitude, lon: c.longitude, icon: icon, fav: true, custom: true), at: 0)
     }
     func delete(_ p: Place) { places.removeAll { $0.id == p.id } }
+    func touch(_ p: Place) {
+        if let i = places.firstIndex(where: { $0.id == p.id }) { places[i].used = Date().timeIntervalSince1970 }
+    }
 }
 
 // MARK: - Settings

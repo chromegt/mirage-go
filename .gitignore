@@ -7,3 +7,6 @@ DerivedData/
 pairing/
 Vendor/idevice/libidevice_ffi.a
 ref/
+
+# local tooling
+.claude/

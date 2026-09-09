@@ -6,8 +6,11 @@ service through a loopback VPN (LocalDev VPN), using a pairing file made once on
 StikDebug and Locus use.
 
 - No jailbreak. Nothing leaves the phone.
-- Places, Realistic travel (glide at walk/jog/bike/drive speed), GPS jitter, Kill switch.
-- Guided setup checklist, background keep-alive, auto-rebuild when the link hiccups, drop notification.
+- Home is a full-bleed world stage: a 3D globe while idle that flies down to the place once the phone appears there,
+  a status pill with a session clock, quick places, drop-a-pin on the map.
+- Places (search, coordinates, favourites), Realistic travel (glide at walk/jog/bike/drive speed), GPS jitter, Kill switch.
+- Guided setup checklist, background keep-alive, 15-minute auto-rebuild when the link drops (amber "Reconnecting"
+  state, never a false green), drop notification.
 
 Built without a Mac: GitHub Actions (macOS runner, XcodeGen, unsigned archive) produces `MirageGo.ipa`; install it
 with Sideloadly on Windows. See **SETUP.md** for the user steps and **RESEARCH.md** for the architecture, sources
@@ -25,7 +28,7 @@ MirageGo/
   Keepers.swift              silent audio + background location so iOS keeps the socket alive
   Support.swift              pairing file store, DDI download, LocalDev VPN helper, places, settings, network monitor
   ContentView.swift          Home / Places / Settings / Setup, monochrome design
-  Assets.xcassets            app icon, logo, launch colour
+  Assets.xcassets            app icon, logo, launch logo + colour
 pairing/                     (gitignored) pairingFile.plist for this phone
 ```
 
