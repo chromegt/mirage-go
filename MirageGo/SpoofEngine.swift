@@ -35,6 +35,10 @@ final class SpoofEngine: ObservableObject {
     init() {
         position = CLLocationCoordinate2D(latitude: AppSettings.shared.lastLat, longitude: AppSettings.shared.lastLon)
         positionName = AppSettings.shared.lastName
+        NetworkMonitor.shared.onChange = { [weak self] in
+            // Wi-Fi <-> cellular switches can stall the loopback; a push doubles as the health check.
+            Task { @MainActor in self?.send() }
+        }
     }
 
     var isActive: Bool { phase == .active }
@@ -162,6 +166,7 @@ final class SpoofEngine: ObservableObject {
         tunnel = t; channel = ch
         phase = .active
         lastSetAt = Date()
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
         AppLog.shared.add("spoofing \(Geo.fmt(target))")
         beginKeepAlive()
         armResend()

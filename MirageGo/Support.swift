@@ -135,6 +135,32 @@ enum VPNHelper {
     }
 }
 
+// MARK: - Network
+
+import Network
+
+/// Watches the phone's network path so the engine can re-push after Wi-Fi/cellular switches and the UI can show
+/// the Airplane-Mode tip when the phone is cellular-only.
+final class NetworkMonitor: ObservableObject {
+    static let shared = NetworkMonitor()
+    @Published private(set) var cellularOnly = false
+    @Published private(set) var hasWifi = false
+    var onChange: (() -> Void)?
+    private let monitor = NWPathMonitor()
+
+    private init() {
+        monitor.pathUpdateHandler = { [weak self] path in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.hasWifi = path.usesInterfaceType(.wifi)
+                self.cellularOnly = path.usesInterfaceType(.cellular) && !path.usesInterfaceType(.wifi)
+                self.onChange?()
+            }
+        }
+        monitor.start(queue: DispatchQueue(label: "net.summitclient.mirage-go.net"))
+    }
+}
+
 // MARK: - Geo maths
 
 enum Geo {
