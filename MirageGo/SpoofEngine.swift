@@ -26,6 +26,8 @@ final class SpoofEngine: ObservableObject {
     @Published var hint: String?
     @Published var ddiStatus = "unknown"
     @Published var lastSetAt: Date?
+    /// When the current session went active; drives the session clock in the status pill.
+    @Published var connectedAt: Date?
 
     private var tunnel: DeviceTunnel?
     private var channel: LocationChannel?
@@ -121,6 +123,7 @@ final class SpoofEngine: ObservableObject {
         for i in steps.indices where steps[i].status == "busy" { steps[i].status = "fail" }
         error = message; self.hint = hint
         phase = .idle
+        connectedAt = nil
         connectTask = nil
         DDIMounter.progress = { _ in }
         teardownHandles()
@@ -301,6 +304,7 @@ final class SpoofEngine: ObservableObject {
         connectTask = nil
         phase = .active
         lastSetAt = Date()
+        connectedAt = Date()
         UINotificationFeedbackGenerator().notificationOccurred(.success)
         AppLog.shared.add("spoofing \(Geo.fmt(target))")
         armResend()
@@ -333,6 +337,7 @@ final class SpoofEngine: ObservableObject {
         }
         endKeepAlive()
         phase = .idle
+        connectedAt = nil
         steps = []
         AppLog.shared.add("real location restored")
     }
@@ -500,6 +505,7 @@ final class SpoofEngine: ObservableObject {
                 // Give up: only now do the keepers stop (the app will be suspended shortly after).
                 self.stopTimers(); self.stopTravel(); self.endKeepAlive()
                 self.phase = .idle
+                self.connectedAt = nil
                 self.error = "Spoof dropped: \(why)"; self.hint = "Check LocalDev VPN is connected (Wi-Fi on, or Airplane Mode on cellular) and press Connect."
                 Notify.post("Mirage Go stopped", "The spoof dropped. Open Mirage Go to reconnect.")
             }

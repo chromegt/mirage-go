@@ -229,6 +229,11 @@ enum Geo {
         return CLLocationCoordinate2D(latitude: p2 * 180 / .pi, longitude: l2 * 180 / .pi)
     }
     static func fmt(_ c: CLLocationCoordinate2D) -> String { String(format: "%.5f, %.5f", c.latitude, c.longitude) }
+    /// Session clock: m:ss under an hour, h:mm:ss after.
+    static func fmtClock(_ s: Double) -> String {
+        let t = Int(max(0, s))
+        return t >= 3600 ? String(format: "%d:%02d:%02d", t / 3600, t / 60 % 60, t % 60) : String(format: "%d:%02d", t / 60, t % 60)
+    }
     static func fmtDist(_ m: Double) -> String { m >= 1000 ? String(format: "%.2f km", m / 1000) : "\(Int(m.rounded())) m" }
     static func fmtDur(_ s: Double) -> String {
         if s >= 3600 { return "\(Int(s / 3600))h \(Int(s.truncatingRemainder(dividingBy: 3600) / 60))m" }
