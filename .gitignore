@@ -1,0 +1,7 @@
+*.ipa
+*.xcodeproj/
+build/
+DerivedData/
+.DS_Store
+*.plist.bak
+pairing/
