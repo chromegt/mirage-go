@@ -86,51 +86,6 @@ struct GlassCircleButton: View {
 
 /// Top scrim for the scrolling tabs: solid under the status bar, a short fade below it, so scrolled rows never run
 /// under the clock. Overlay it on the ScrollView with `alignment: .top`.
-/// Stars around the planet while the stage is zoomed all the way out: the desktop app's space backdrop. Positions
-/// are deterministic, the brightest few twinkle slowly, and a radial mask keeps the centre (where the globe sits)
-/// clear so the stars only live in space. Drawn with plusLighter so they only ever add light.
-struct Starfield: View {
-    struct Star { let x: CGFloat; let y: CGFloat; let r: CGFloat; let a: Double }
-    static let stars: [Star] = {
-        var g = SeededRandom(seed: 0x5EED_1234)
-        return (0..<190).map { _ in
-            Star(x: CGFloat(g.next()), y: CGFloat(g.next()), r: CGFloat(0.45 + g.next() * 1.05), a: 0.22 + g.next() * 0.7)
-        }
-    }()
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    var body: some View {
-        TimelineView(.periodic(from: .now, by: reduceMotion ? 3600 : 0.6)) { ctx in
-            let t = ctx.date.timeIntervalSinceReferenceDate
-            Canvas { g, size in
-                for (i, s) in Self.stars.enumerated() {
-                    let twinkle = (!reduceMotion && i % 7 == 0) ? 0.45 + 0.55 * abs(sin(t * 0.8 + Double(i))) : 1.0
-                    let p = CGPoint(x: s.x * size.width, y: s.y * size.height)
-                    g.fill(Path(ellipseIn: CGRect(x: p.x - s.r, y: p.y - s.r, width: s.r * 2, height: s.r * 2)),
-                           with: .color(.white.opacity(s.a * twinkle)))
-                    if s.r > 1.3 {   // a soft halo on the biggest ones
-                        g.fill(Path(ellipseIn: CGRect(x: p.x - s.r * 3, y: p.y - s.r * 3, width: s.r * 6, height: s.r * 6)),
-                               with: .color(.white.opacity(0.06 * twinkle)))
-                    }
-                }
-            }
-        }
-        .blendMode(.plusLighter)
-        .mask(RadialGradient(stops: [.init(color: .clear, location: 0), .init(color: .clear, location: 0.4), .init(color: .white, location: 0.68)],
-                             center: .center, startRadius: 0, endRadius: 300))
-        .allowsHitTesting(false)
-    }
-}
-
-/// Tiny LCG so the star layout is the same on every launch (no Foundation randomness in a view body).
-struct SeededRandom {
-    private var state: UInt64
-    init(seed: UInt64) { state = seed }
-    mutating func next() -> Double {
-        state = state &* 6364136223846793005 &+ 1442695040888963407
-        return Double(state >> 11) / Double(UInt64(1) << 53)
-    }
-}
-
 struct TopScrim: View {
     var body: some View {
         LinearGradient(stops: [.init(color: Theme.bg, location: 0),
@@ -412,7 +367,7 @@ struct HomeView: View {
     @Binding var camera: MapCameraPosition
     @State private var now = Date()
     @State private var pending: CLLocationCoordinate2D?
-    /// Tracks the live camera so the single zoom button knows which way to go (and the stars know when to show).
+    /// Tracks the live camera so the single zoom button knows which way to go .
     @State private var zoomedOut = true
     @AppStorage("mapHintSeen") private var mapHintSeen = false
 
@@ -450,7 +405,6 @@ struct HomeView: View {
     var body: some View {
         ZStack(alignment: .top) {
             stageMap.ignoresSafeArea()
-            if settings.stars && zoomedOut { Starfield().ignoresSafeArea().transition(.opacity) }
             // Scrims: a legible brand bar under the status bar, and a deep fade at the bottom so the status text and
             // the pinned buttons sit on black.
             VStack(spacing: 0) {
@@ -1200,8 +1154,6 @@ struct SettingsView: View {
     var mapGroup: some View {
         group("Map") {
             toggleRow("Colour map", "Apple's satellite colours instead of the black & white world.", isOn: $settings.colourMap)
-            sep
-            toggleRow("Stars in space", "A starfield around the planet when you zoom all the way out.", isOn: $settings.stars)
         }
     }
 
