@@ -295,6 +295,10 @@ final class PlaceStore: ObservableObject {
         places.insert(Place(id: UUID().uuidString, name: name, lat: c.latitude, lon: c.longitude, icon: icon, fav: true, custom: true), at: 0)
     }
     func delete(_ p: Place) { places.removeAll { $0.id == p.id } }
+    /// Custom places only (presets keep their names); the caller validates the new name.
+    func rename(_ p: Place, to n: String) {
+        if let i = places.firstIndex(where: { $0.id == p.id }) { places[i].name = n }
+    }
     func touch(_ p: Place) {
         if let i = places.firstIndex(where: { $0.id == p.id }) { places[i].used = Date().timeIntervalSince1970 }
     }

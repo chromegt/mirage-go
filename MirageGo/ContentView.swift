@@ -66,6 +66,45 @@ struct StatusDot: View {
     var body: some View { Circle().fill(color).frame(width: 8, height: 8).shadow(color: color.opacity(0.8), radius: 5) }
 }
 
+/// The round glass control shared by the map stage and the tab headers: 44 pt, material, hairline, plain style.
+struct GlassCircleButton: View {
+    let symbol: String
+    let label: String
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol).font(.callout.weight(.semibold)).foregroundStyle(.white)
+                .frame(width: 44, height: 44)
+                .background(.ultraThinMaterial)
+                .overlay(Circle().stroke(Theme.line, lineWidth: 1))
+                .clipShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+    }
+}
+
+/// Top scrim for the scrolling tabs: solid under the status bar, a short fade below it, so scrolled rows never run
+/// under the clock. Overlay it on the ScrollView with `alignment: .top`.
+struct TopScrim: View {
+    var body: some View {
+        LinearGradient(stops: [.init(color: Theme.bg, location: 0),
+                               .init(color: Theme.bg, location: 0.35),
+                               .init(color: Theme.bg.opacity(0), location: 1)],
+                       startPoint: .top, endPoint: .bottom)
+            .frame(height: 24)
+            .background(Theme.bg, ignoresSafeAreaEdges: .top)
+            .allowsHitTesting(false)
+    }
+}
+
+/// List rows: a light wash while pressed, nothing else (the row keeps its own layout).
+struct PressRow: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label.background(configuration.isPressed ? Color.white.opacity(0.08) : .clear)
+    }
+}
+
 // MARK: - Readiness
 
 /// Observable snapshot of the prerequisites. The underlying checks (getifaddrs, canOpenURL, fileExists) have no
@@ -115,6 +154,10 @@ struct ContentView: View {
     @EnvironmentObject var ready: Readiness
     @State private var tab = 0
     @State private var showSetup = false
+    /// First launch only: the checklist is a full-screen cover (branded, no accidental swipe-away); later opens are a sheet.
+    @State private var showFirstRun = false
+    /// The first-run check runs once per launch: a dismissed fullScreenCover re-inserts the presenter and re-fires onAppear.
+    @State private var autoOpened = false
     // Map camera lives here so switching tabs does not reset the user's zoom. It starts on the globe, centred on
     // the last place, so the first frame is already the stage (no .automatic -> fly-in jump).
     @State private var camera: MapCameraPosition = .camera(MapCamera(
@@ -160,8 +203,22 @@ struct ContentView: View {
                 )
             }
         }
-        .sheet(isPresented: $showSetup) { SetupView().environmentObject(engine).environmentObject(ready) }
-        .onAppear { if !ready.allGood && !UserDefaults.standard.bool(forKey: "setupSeen") { showSetup = true } }
+        .sheet(isPresented: $showSetup, onDismiss: markSetupSeen) {
+            SetupView().environmentObject(engine).environmentObject(ready)
+                .presentationBackground(Theme.bg)
+                .presentationDragIndicator(.visible)
+        }
+        .fullScreenCover(isPresented: $showFirstRun, onDismiss: markSetupSeen) {
+            SetupView(firstRun: true).environmentObject(engine).environmentObject(ready)
+        }
+        .onAppear {
+            guard !autoOpened else { return }
+            autoOpened = true
+            if !ready.allGood && !UserDefaults.standard.bool(forKey: "setupSeen") {
+                markSetupSeen()   // shown once = seen, so nothing can re-trigger it
+                showFirstRun = true
+            }
+        }
         // Camera follow lives here (not in HomeView) so a pick made on the Places tab still recentres Home.
         // A travel frames both ends; when it ends (arrival, stop, teleport) the camera settles on the position.
         .onChange(of: engine.travel) { _, tr in
@@ -180,6 +237,9 @@ struct ContentView: View {
             withAnimation(.easeInOut(duration: 2.2)) { camera = stageCamera(engine.position, phase: p) }
         }
     }
+
+    /// Any dismissal (button, Close, swipe) counts as "seen"; the checklist never auto-opens twice.
+    func markSetupSeen() { UserDefaults.standard.set(true, forKey: "setupSeen") }
 }
 
 /// Equatable key for the camera follow: the coordinate plus the name, so `onChange` fires on either.
@@ -306,7 +366,9 @@ struct HomeView: View {
         switch engine.phase {
         case .active: return engine.rebuilding ? Theme.warn : Theme.ok
         case .connecting: return Theme.warn
-        case .idle: return Theme.idle   // the error card carries the red; the headline is not the failure
+        // The error card carries the red; the headline is not the failure. Before setup the pill is the
+        // "action needed" amber, same as the brand-bar VPN dot.
+        case .idle: return ready.allGood ? Theme.idle : Theme.warn
         }
     }
     var statusText: String {
@@ -502,15 +564,7 @@ struct HomeView: View {
     }
 
     func mapButton(_ symbol: String, _ label: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: symbol).font(.callout.weight(.semibold)).foregroundStyle(.white)
-                .frame(width: 44, height: 44)
-                .background(.ultraThinMaterial)
-                .overlay(Circle().stroke(Theme.line, lineWidth: 1))
-                .clipShape(Circle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(label)
+        GlassCircleButton(symbol: symbol, label: label, action: action)
     }
 
     /// Same rhythm as the normal footer (pill, headline, detail) so the stage does not jump when a pin drops.
@@ -752,12 +806,16 @@ struct PulseRings: View {
 
 /// Address / point-of-interest search backed by MapKit's completer.
 final class SearchModel: NSObject, ObservableObject, MKLocalSearchCompleterDelegate {
-    @Published var query = "" { didSet { completer.queryFragment = query } }
+    @Published var query = "" { didSet { completer.queryFragment = query; pending = query.count >= 3 } }
     @Published var results: [MKLocalSearchCompletion] = []
     /// The completer reported an error (offline is the normal state on cellular with Airplane Mode on).
     @Published var failed = false
+    /// A completer round-trip is in flight for the current query, so an empty `results` is not "no matches" yet.
+    @Published var pending = false
     /// An MKLocalSearch for a tapped result is in flight (1-3 s); the row shows a spinner and taps are ignored.
     @Published var resolving = false
+    /// title + subtitle of the completion being resolved, so only that row spins.
+    @Published var resolvingKey: String?
     private let completer = MKLocalSearchCompleter()
 
     override init() {
@@ -766,13 +824,13 @@ final class SearchModel: NSObject, ObservableObject, MKLocalSearchCompleterDeleg
         completer.resultTypes = [.address, .pointOfInterest]
     }
 
-    func completerDidUpdateResults(_ c: MKLocalSearchCompleter) { results = c.results; failed = false }
-    func completer(_ c: MKLocalSearchCompleter, didFailWithError error: Error) { results = []; failed = true }
+    func completerDidUpdateResults(_ c: MKLocalSearchCompleter) { results = c.results; failed = false; pending = false }
+    func completer(_ c: MKLocalSearchCompleter, didFailWithError error: Error) { results = []; failed = true; pending = false }
 
     @MainActor
     func resolve(_ completion: MKLocalSearchCompletion) async -> CLLocationCoordinate2D? {
-        resolving = true
-        defer { resolving = false }
+        resolving = true; resolvingKey = completion.title + completion.subtitle
+        defer { resolving = false; resolvingKey = nil }
         let search = MKLocalSearch(request: MKLocalSearch.Request(completion: completion))
         guard let response = try? await search.start() else { return nil }
         return response.mapItems.first?.placemark.coordinate
@@ -794,6 +852,9 @@ struct PlacesView: View {
     @State private var latText = ""
     @State private var lonText = ""
     @State private var searchError: String?
+    /// The coordinates dialog's own message, so a rejected entry never flashes in the search card.
+    @State private var coordsError: String?
+    @State private var renaming: Place?
     @FocusState private var searchFocused: Bool
 
     var favs: [Place] { store.places.filter { $0.fav }.sorted { $0.name < $1.name } }
@@ -805,37 +866,14 @@ struct PlacesView: View {
     var body: some View {
         ScrollView(showsIndicators: false) {
             VStack(alignment: .leading, spacing: 14) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Places").font(.largeTitle.bold())
-                    Text("Tap a place to go there. Hold a place for more.").font(.footnote).foregroundStyle(Theme.muted)
-                }
-                .padding(.horizontal, 20).padding(.top, 8)
-
+                header
                 searchCard
-
-                HStack(spacing: 8) {
-                    if !alreadySaved {
-                        Button {
-                            let n = engine.travel?.name ?? engine.positionName
-                            newName = Geo.isGeneric(n) ? "" : n
-                            naming = true
-                        } label: {
-                            Label("Save map point", systemImage: "plus")
-                        }
-                        .buttonStyle(Button3D(dark: true, compact: true))
-                    }
-                    Button { searchError = nil; coordsEntry = true } label: {
-                        Label("Coordinates", systemImage: "number")
-                    }
-                    .buttonStyle(Button3D(dark: true, compact: true))
-                }
-                .padding(.horizontal, 16)
-
-                if !favs.isEmpty { section("Favorites", favs) }
+                if favs.isEmpty { favHint } else { section("Favorites", favs) }
                 section(favs.isEmpty ? "All places" : "More places", rest)
                 Color.clear.frame(height: 8)
             }
         }
+        .overlay(alignment: .top) { TopScrim() }
         .scrollDismissesKeyboard(.interactively)
         // A stale red error must not persist while the user retypes.
         .onChange(of: search.query) { _, _ in searchError = nil }
@@ -846,7 +884,7 @@ struct PlacesView: View {
                 if n.isEmpty { n = "My place" }
                 if store.places.contains(where: { $0.name == n }) { n += " 2" }
                 withAnimation { store.add(name: n, at: saveTarget, icon: "📍") }
-                if engine.travel == nil { engine.positionName = n }
+                if engine.travel == nil { engine.positionName = n; AppSettings.shared.lastName = n }
             }
             Button("Cancel", role: .cancel) {}
         } message: { Text(Geo.fmt(saveTarget)) }
@@ -856,20 +894,35 @@ struct PlacesView: View {
             Button("Go") {
                 if let lat = Double(latText.trimmingCharacters(in: .whitespaces)), let lon = Double(lonText.trimmingCharacters(in: .whitespaces)),
                    (-90...90).contains(lat), (-180...180).contains(lon) {
-                    latText = ""; lonText = ""; searchError = nil
+                    latText = ""; lonText = ""; coordsError = nil
                     go(CLLocationCoordinate2D(latitude: lat, longitude: lon), name: "Typed coordinates")
                 } else {
                     // Keep what was typed and re-open the dialog with the message in it, instead of surfacing the
                     // error in the search card after the dialog has closed.
-                    searchError = "Coordinates must be latitude -90…90 and longitude -180…180."
+                    coordsError = "That doesn't look right. Latitude is -90 to 90, longitude -180 to 180."
                     Task { @MainActor in
                         try? await Task.sleep(for: .milliseconds(350))
                         coordsEntry = true
                     }
                 }
             }
-            Button("Cancel", role: .cancel) { latText = ""; lonText = ""; searchError = nil }
-        } message: { Text(searchError ?? "Decimal degrees, as shown on any map app.") }
+            Button("Cancel", role: .cancel) { latText = ""; lonText = ""; coordsError = nil }
+        } message: { Text(coordsError ?? "Decimal degrees, as shown on any map app.") }
+        .alert("Rename", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
+            TextField("Name", text: $newName)
+            Button("Save") {
+                if let r = renaming {
+                    let n = newName.trimmingCharacters(in: .whitespaces)
+                    if !n.isEmpty {
+                        store.rename(r, to: n)
+                        if engine.positionName == r.name { engine.positionName = n; AppSettings.shared.lastName = n }
+                        if engine.travel?.name == r.name { engine.travel?.name = n }
+                    }
+                }
+                renaming = nil
+            }
+            Button("Cancel", role: .cancel) { renaming = nil }
+        }
         .alert("Delete \(pendingDelete?.name ?? "")?", isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } })) {
             Button("Delete", role: .destructive) { if let p = pendingDelete { withAnimation { store.delete(p) } }; pendingDelete = nil }
             Button("Cancel", role: .cancel) { pendingDelete = nil }
@@ -885,6 +938,33 @@ struct PlacesView: View {
         tab = 0
     }
 
+    /// Rounded title (same face as the Home headline) with the save-point button in the title row.
+    var header: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 12) {
+                Text("Places").font(.system(size: 34, weight: .bold, design: .rounded))
+                Spacer()
+                GlassCircleButton(symbol: "plus", label: alreadySaved ? "Current point already saved" : "Save the current map point") {
+                    let n = engine.travel?.name ?? engine.positionName
+                    newName = Geo.isGeneric(n) ? "" : n
+                    naming = true
+                }
+                .disabled(alreadySaved).opacity(alreadySaved ? 0.4 : 1)
+            }
+            Text("Tap to go there · hold for more").font(.footnote).foregroundStyle(Theme.muted)
+        }
+        .padding(.horizontal, 20).padding(.top, 24)   // clears the TopScrim so the title is never under it at rest
+    }
+
+    /// Presets ship unstarred, so the first run needs one line saying what the star does.
+    var favHint: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "star").foregroundStyle(Theme.dim)
+            Text("Star places to pin them here and first on Home.").font(.footnote).foregroundStyle(Theme.muted)
+        }
+        .padding(.horizontal, 30)
+    }
+
     var searchCard: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
@@ -893,7 +973,13 @@ struct PlacesView: View {
                     .textFieldStyle(.plain).submitLabel(.search).focused($searchFocused)
                     .autocorrectionDisabled()
                     .onSubmit { if let first = search.results.first { pick(first) } }
-                if !search.query.isEmpty {
+                if search.query.isEmpty {
+                    // The coordinates entry lives in the field while it is empty; the clear button takes the slot while typing.
+                    Button { searchError = nil; coordsError = nil; coordsEntry = true } label: {
+                        Image(systemName: "number").foregroundStyle(Theme.dim).frame(width: 44, height: 44)
+                    }
+                    .buttonStyle(.plain).accessibilityLabel("Type coordinates")
+                } else {
                     Button { search.clear() } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(Theme.dim).frame(width: 44, height: 44) }
                         .buttonStyle(.plain).accessibilityLabel("Clear search")
                 }
@@ -905,17 +991,24 @@ struct PlacesView: View {
             }
             // Offline is this app's normal state on cellular, so an empty list needs to say why it is empty.
             if !search.query.isEmpty && search.results.isEmpty {
-                Text(search.failed
-                     ? "No internet (Airplane Mode?). Search is off — tap the map or use Coordinates instead."
-                     : search.query.count < 3 ? "Keep typing…" : "No matches")
-                    .font(.caption).foregroundStyle(Theme.dim).frame(maxWidth: .infinity, alignment: .leading).padding(12)
+                if search.failed {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "wifi.slash").foregroundStyle(Theme.warn)
+                        Text("No internet, so search is off. Tap the map on Home, or use # to type coordinates.")
+                            .font(.footnote).foregroundStyle(Theme.muted).fixedSize(horizontal: false, vertical: true)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(12)
+                } else {
+                    Text(search.query.count < 3 ? "Keep typing…" : search.pending ? "Searching…" : "No matches")
+                        .font(.caption).foregroundStyle(Theme.dim).frame(maxWidth: .infinity, alignment: .leading).padding(12)
+                }
             }
             if !search.results.isEmpty && !search.query.isEmpty {
                 Divider().overlay(Theme.line)
                 ForEach(Array(search.results.prefix(6).enumerated()), id: \.offset) { _, r in
                     Button { pick(r) } label: {
                         HStack(spacing: 10) {
-                            if search.resolving { ProgressView().tint(Theme.muted) } else { Image(systemName: "mappin.circle").foregroundStyle(Theme.muted) }
+                            if search.resolvingKey == r.title + r.subtitle { ProgressView().tint(Theme.muted) } else { Image(systemName: "mappin.circle").foregroundStyle(Theme.muted) }
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(r.title).font(.subheadline.weight(.semibold)).foregroundStyle(.white).lineLimit(1)
                                 if !r.subtitle.isEmpty { Text(r.subtitle).font(.caption).foregroundStyle(Theme.dim).lineLimit(1) }
@@ -948,36 +1041,7 @@ struct PlacesView: View {
             Text(title.uppercased()).font(.caption.weight(.semibold)).foregroundStyle(Theme.header).padding(.horizontal, 30)
             VStack(spacing: 0) {
                 ForEach(items) { p in
-                    let selected = Geo.distance(engine.position, p.coordinate) < 2
-                    HStack(spacing: 12) {
-                        Text(p.icon).font(.title3).frame(width: 36, height: 36).background(Theme.card2).clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(p.name).font(.subheadline.weight(.semibold)).foregroundStyle(.white)
-                            Text(Geo.fmt(p.coordinate)).font(.caption.monospacedDigit()).foregroundStyle(Theme.dim)
-                        }
-                        Spacer()
-                        if selected {
-                            // "Here" only while the channel is really open; during a rebuild the phone shows its real location.
-                            let here = engine.isActive && !engine.rebuilding
-                            Text(here ? "Here" : "Selected").font(.caption2.weight(.bold)).padding(.horizontal, 8).padding(.vertical, 4).background(here ? Theme.ok : Color.white).foregroundStyle(.black).clipShape(Capsule())
-                        }
-                        Button { withAnimation { store.toggleFav(p) } } label: {
-                            Image(systemName: p.fav ? "star.fill" : "star").foregroundStyle(p.fav ? .white : Theme.dim)
-                                .frame(width: 44, height: 44).contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel(p.fav ? "Remove from favourites" : "Add to favourites")
-                    }
-                    .padding(.horizontal, 12).padding(.vertical, 6)
-                    .background(selected ? Color.white.opacity(0.06) : .clear)
-                    .contentShape(Rectangle())
-                    .onTapGesture { store.touch(p); go(p.coordinate, name: p.name) }
-                    .contextMenu {
-                        Button { withAnimation { store.toggleFav(p) } } label: { Label(p.fav ? "Unfavourite" : "Favourite", systemImage: "star") }
-                        if p.custom {
-                            Button(role: .destructive) { pendingDelete = p } label: { Label("Delete", systemImage: "trash") }
-                        }
-                    }
+                    placeRow(p)
                     if p.id != items.last?.id { Divider().overlay(Theme.line).padding(.leading, 64) }
                 }
             }
@@ -985,6 +1049,54 @@ struct PlacesView: View {
             .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(Theme.line, lineWidth: 1))
             .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
             .padding(.horizontal, 16)
+        }
+    }
+
+    /// A real Button (pressed wash, VoiceOver button trait) with the star kept outside it as a trailing overlay,
+    /// so the two taps never nest. 56 pt tall: 44 min content + 6 top/bottom.
+    func placeRow(_ p: Place) -> some View {
+        let selected = Geo.distance(engine.position, p.coordinate) < 2
+        // "Here" only while the channel is really open; during a rebuild the phone shows its real location.
+        let here = engine.isActive && !engine.rebuilding
+        return ZStack(alignment: .trailing) {
+            Button { store.touch(p); go(p.coordinate, name: p.name) } label: {
+                HStack(spacing: 12) {
+                    Text(p.icon).font(.title3).frame(width: 36, height: 36).background(Theme.card2)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(selected ? Color.white : .clear, lineWidth: 1.5))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(p.name).font(.subheadline.weight(.semibold)).foregroundStyle(.white)
+                        // Coordinates only where the name is weak (user-saved points); presets read as icon + name.
+                        if p.custom { Text(Geo.fmt(p.coordinate)).font(.caption.monospacedDigit()).foregroundStyle(Theme.dim) }
+                    }
+                    Spacer()
+                    if selected {
+                        Text(here ? "Here" : "Selected").font(.caption2.weight(.bold)).padding(.horizontal, 8).padding(.vertical, 4).background(here ? Theme.ok : Color.white).foregroundStyle(.black).clipShape(Capsule())
+                    }
+                }
+                .frame(minHeight: 44)
+                .padding(.leading, 12).padding(.trailing, 60).padding(.vertical, 6)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(PressRow())
+            .accessibilityLabel(p.name)
+            .accessibilityAddTraits(selected ? [.isSelected] : [])
+            Button { UISelectionFeedbackGenerator().selectionChanged(); withAnimation { store.toggleFav(p) } } label: {
+                Image(systemName: p.fav ? "star.fill" : "star").foregroundStyle(p.fav ? .white : Theme.dim)
+                    .frame(width: 44, height: 44).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(p.fav ? "Remove from favourites" : "Add to favourites")
+            .padding(.trailing, 8)
+        }
+        .background(selected ? Color.white.opacity(0.06) : .clear)
+        .contextMenu {
+            Button { withAnimation { store.toggleFav(p) } } label: { Label(p.fav ? "Unfavourite" : "Favourite", systemImage: "star") }
+            Button { UIPasteboard.general.string = Geo.fmt(p.coordinate) } label: { Label("Copy coordinates", systemImage: "doc.on.doc") }
+            if p.custom {
+                Button { newName = p.name; renaming = p } label: { Label("Rename", systemImage: "pencil") }
+                Button(role: .destructive) { pendingDelete = p } label: { Label("Delete", systemImage: "trash") }
+            }
         }
     }
 }
@@ -1019,143 +1131,39 @@ struct SettingsView: View {
     @Binding var showSetup: Bool
     @State private var importing = false
     @State private var importError: String?
-    @State private var importOK = false
     @State private var busy = ""
     @State private var downloadError: String?
-    @State private var ipText = ""
-    @State private var portText = ""
+    // Seeded from the store (not in onAppear) so the validation lines never flash red on the first frame.
+    @State private var ipText = AppSettings.shared.deviceIP
+    @State private var portText = String(AppSettings.shared.devicePort)
+    @State private var showLog = false
+    @State private var copied = false
     @FocusState private var focus: Field?
 
     var body: some View {
         ScrollView(showsIndicators: false) {
             VStack(alignment: .leading, spacing: 14) {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Settings").font(.largeTitle.bold())
-                    Text("Changes apply right away.").font(.footnote).foregroundStyle(Theme.muted)
+                    Text("Settings").font(.system(size: 34, weight: .bold, design: .rounded))
+                    Text("How the phone moves, and whether it is ready.").font(.footnote).foregroundStyle(Theme.muted)
                 }
-                .padding(.horizontal, 20).padding(.top, 8)
-
-                group("Movement") {
-                    toggleRow("Realistic travel", "Glide to a new place at a real speed instead of jumping.", isOn: $settings.travel)
-                    Picker("Speed", selection: $settings.travelSpeed) {
-                        ForEach(AppSettings.speeds, id: \.id) { s in Text(s.label).tag(s.id) }
-                    }
-                    .pickerStyle(.segmented).padding(.vertical, 6)
-                    .disabled(!settings.travel).opacity(settings.travel ? 1 : 0.4)
-                    .animation(.easeOut(duration: 0.15), value: settings.travel)
-                    toggleRow("GPS jitter", "Drift a few metres every few seconds, like a real GPS fix.", isOn: Binding(get: { settings.jitter }, set: { engine.setJitter($0) }))
-                    if settings.jitter {
-                        HStack { Text("Max drift").font(.subheadline); Slider(value: $settings.jitterMeters, in: 1...15, step: 1).tint(.white); Text("\(Int(settings.jitterMeters)) m").font(.subheadline.monospacedDigit()).foregroundStyle(Theme.muted) }
-                    }
-                }
-
-                group("Phone link") {
-                    // Grouped so each ViewBuilder stays under the 10-child limit.
-                    Group {
-                        statusRow("LocalDev VPN", ready.vpnUp ? "Connected" : ready.vpnInstalled ? "Installed, not connected" : "Not installed", ready.vpnUp ? Theme.ok : Theme.warn)
-                        Button(ready.vpnInstalled ? "Open LocalDev VPN" : "Get LocalDev VPN") { if ready.vpnInstalled { VPNHelper.open() } else { VPNHelper.openStore() } }
-                            .buttonStyle(RowAction())
-                    }
-                    Group {
-                        statusRow("Pairing file", ready.pairing ? "Imported (\(ready.pairingKind))" : ready.pairingKind == "none" ? "Missing" : "Wrong kind: \(ready.pairingKind)", ready.pairing ? Theme.ok : Theme.warn)
-                        Button("Import pairing file…") { importing = true }.buttonStyle(Button3D(dark: true, compact: true))
-                        if let e = importError {
-                            Label(e, systemImage: "exclamationmark.triangle.fill").font(.caption.weight(.semibold)).foregroundStyle(Theme.danger)
-                        }
-                        if importOK {
-                            Label("Pairing file imported", systemImage: "checkmark.circle.fill").font(.caption.weight(.semibold)).foregroundStyle(Theme.ok)
-                        }
-                        Text("Or drop pairingFile.plist into the Mirage Go folder (Files app or Apple Devices file sharing); it is picked up automatically.").font(.footnote).lineSpacing(2).foregroundStyle(Theme.dim)
-                    }
-                    Group {
-                        statusRow("Developer image", ready.ddiFiles ? (engine.ddiStatus == "mounted" ? "Ready · mounted" : "Files ready") : "Not downloaded yet", ready.ddiFiles ? Theme.ok : Theme.warn)
-                        Button(busy.isEmpty ? (ready.ddiFiles ? "Re-download developer image" : "Download developer image (16 MB)") : busy) {
-                            Task {
-                                busy = "Downloading…"; downloadError = nil
-                                if ready.ddiFiles { DDIStore.removeAll() }
-                                do { try await DDIStore.download { s in busy = s } } catch { downloadError = error.localizedDescription }
-                                try? await Task.sleep(for: .seconds(1)); busy = ""; ready.refresh()
-                            }
-                        }.buttonStyle(Button3D(dark: true, compact: true)).disabled(!busy.isEmpty)
-                        if let e = downloadError {
-                            Label(e, systemImage: "exclamationmark.triangle.fill").font(.caption.weight(.semibold)).foregroundStyle(Theme.danger)
-                        }
-                    }
-                    Group {
-                        statusRow("Background location", authText, authColor)
-                        if ready.locationAuth == .authorizedWhenInUse {
-                            // The one-shot "Always" upgrade prompt is asked here, in the foreground with nothing
-                            // pending, so no app switch can dismiss it (it used to be burned inside Connect).
-                            Button("Allow Always") { LocationKeeper.shared.requestAlwaysUpgrade() }
-                                .buttonStyle(Button3D(compact: true))
-                        }
-                        if ready.locationAuth != .authorizedAlways {
-                            Text("Set Location to Always so the spoof keeps running when the phone is locked.").font(.footnote).lineSpacing(2).foregroundStyle(Theme.dim)
-                        }
-                        HStack(spacing: 8) {
-                            if ready.locationAuth != .authorizedAlways {
-                                Button("Open iOS Settings") { if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) } }
-                                    .buttonStyle(RowAction())
-                            }
-                            Button("Setup checklist") { showSetup = true }.buttonStyle(RowAction())
-                        }
-                    }
-                }
-
-                group("Advanced") {
-                    HStack {
-                        Text("Device IP").font(.subheadline).foregroundStyle(Theme.muted); Spacer()
-                        TextField("10.7.0.1", text: $ipText).multilineTextAlignment(.trailing).keyboardType(.decimalPad)
-                            .foregroundStyle(.white).focused($focus, equals: .ip)
-                    }
-                    if !isIPv4(ipText) { Text("Not a valid IPv4 address").font(.caption).foregroundStyle(Theme.danger) }
-                    HStack {
-                        Text("Port").font(.subheadline).foregroundStyle(Theme.muted); Spacer()
-                        TextField("49152", text: $portText).multilineTextAlignment(.trailing).keyboardType(.numberPad)
-                            .foregroundStyle(.white).focused($focus, equals: .port)
-                    }
-                    if Int(portText).map({ $0 > 0 && $0 < 65536 }) != true { Text("Port must be 1–65535").font(.caption).foregroundStyle(Theme.danger) }
-                    Button("Reset to defaults") {
-                        settings.deviceIP = "10.7.0.1"; settings.devicePort = 49152
-                        ipText = settings.deviceIP; portText = String(settings.devicePort); focus = nil
-                    }
-                    .buttonStyle(RowAction())
-                    Text("Leave these unless LocalDev VPN tells you otherwise. Cellular only: Airplane Mode on → connect the VPN → Connect → cellular back on.").font(.footnote).lineSpacing(2).foregroundStyle(Theme.dim)
-                }
-
-                group("Log") {
-                    ScrollViewReader { proxy in
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 2) {
-                                ForEach(Array(log.lines.suffix(80).enumerated()), id: \.offset) { _, l in
-                                    Text(l).font(.system(size: 11, design: .monospaced)).foregroundStyle(l.contains("failed") || l.contains("lost") ? Theme.danger : Theme.muted)
-                                }
-                                Color.clear.frame(height: 1).id("end")
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .frame(height: 170)
-                        .onAppear { proxy.scrollTo("end", anchor: .bottom) }
-                        .onChange(of: log.lines.count) { _, _ in proxy.scrollTo("end", anchor: .bottom) }
-                    }
-                    Button("Copy log") { UIPasteboard.general.string = log.lines.joined(separator: "\n"); UINotificationFeedbackGenerator().notificationOccurred(.success) }.buttonStyle(RowAction())
-                }
-
-                group("About") {
-                    statusRow("Mirage Go", Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "", Theme.muted)
-                    Text("Only changes what this iPhone reports. It uses Apple's developer location service through LocalDev VPN; nothing is jailbroken and nothing leaves the phone.").font(.footnote).lineSpacing(2).foregroundStyle(Theme.dim)
-                }
+                .padding(.horizontal, 20).padding(.top, 24)   // clears the TopScrim so the title is never under it at rest
+                movement
+                phoneLink
+                advanced
+                logGroup
+                about
                 Color.clear.frame(height: 8)
             }
         }
+        .overlay(alignment: .top) { TopScrim() }
         .scrollDismissesKeyboard(.interactively)
         .toolbar {
             ToolbarItemGroup(placement: .keyboard) {
                 Spacer()
-                Button("Done") { focus = nil }.fontWeight(.semibold)
+                Button("Done") { focus = nil }.fontWeight(.semibold).tint(.white)
             }
         }
-        .onAppear { ipText = settings.deviceIP; portText = String(settings.devicePort) }
         .onChange(of: focus) { _, f in
             // Commit the buffered fields only when they lose focus, so half-typed values never reach the engine.
             if f != .ip {
@@ -1175,11 +1183,10 @@ struct SettingsView: View {
                     try PairingStore.install(from: u)
                     AppLog.shared.add("pairing file imported")
                     UINotificationFeedbackGenerator().notificationOccurred(.success)
-                    importError = nil; importOK = true
-                    Task { try? await Task.sleep(for: .seconds(2)); importOK = false }
+                    importError = nil
                 } catch {
                     AppLog.shared.add("import failed: \(error.localizedDescription)")
-                    importError = error.localizedDescription; importOK = false
+                    importError = error.localizedDescription
                 }
                 ready.refresh()
             case .failure(let e): AppLog.shared.add("import cancelled: \(e.localizedDescription)")
@@ -1187,32 +1194,248 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: groups
+
+    var movement: some View {
+        group("Movement") {
+            toggleRow("Realistic travel", "Glide to a new place at a real speed instead of jumping.", isOn: $settings.travel)
+            speedChips
+            sep
+            toggleRow("GPS jitter", "Drift a few metres every few seconds, like a real GPS fix.", isOn: Binding(get: { settings.jitter }, set: { engine.setJitter($0) }))
+            if settings.jitter {
+                HStack {
+                    Text("Max drift").font(.subheadline)
+                    Slider(value: $settings.jitterMeters, in: 1...15, step: 1).tint(.white)
+                    // Fixed width so "4 m" -> "15 m" does not shorten the track mid-drag.
+                    Text("\(Int(settings.jitterMeters)) m").font(.subheadline.monospacedDigit()).foregroundStyle(Theme.muted).frame(width: 40, alignment: .trailing)
+                }
+            }
+        }
+        .animation(.easeOut(duration: 0.2), value: settings.jitter)
+    }
+
+    /// Home's quick-places chip language (selected = white/black) with a real label, instead of the grey segmented picker.
+    var speedChips: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Speed").font(.subheadline)
+            HStack(spacing: 6) {
+                ForEach(AppSettings.speeds, id: \.id) { s in
+                    let on = settings.travelSpeed == s.id
+                    Button { UISelectionFeedbackGenerator().selectionChanged(); settings.travelSpeed = s.id } label: {
+                        Text(s.label).font(.subheadline.weight(.semibold))
+                            .foregroundStyle(on ? .black : .white)
+                            .frame(maxWidth: .infinity).padding(.vertical, 8)
+                            .background(on ? Color.white : Theme.card2)
+                            .overlay(Capsule().stroke(on ? Color.white : Theme.line, lineWidth: 1))
+                            .clipShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(on ? [.isSelected] : [])
+                }
+            }
+            .animation(.easeOut(duration: 0.15), value: settings.travelSpeed)
+        }
+        .disabled(!settings.travel).opacity(settings.travel ? 1 : 0.4)
+        .animation(.easeOut(duration: 0.15), value: settings.travel)
+    }
+
+    /// Status lines; the one fix action shows only while a row is amber, maintenance only when nothing is wrong.
+    var phoneLink: some View {
+        group("Phone link", action: ("Setup checklist", { showSetup = true })) {
+            linkRow("LocalDev VPN", ready.vpnUp ? "Connected" : ready.vpnInstalled ? "Not connected" : "Not installed", ok: ready.vpnUp) {
+                Button(ready.vpnInstalled ? "Open LocalDev VPN" : "Get LocalDev VPN") { if ready.vpnInstalled { VPNHelper.open() } else { VPNHelper.openStore() } }
+            }
+            sep
+            linkRow("Pairing file", ready.pairing ? "Imported" : ready.pairingKind == "none" ? "Missing" : "Wrong kind", ok: ready.pairing) {
+                Button("Import pairing file…") { importing = true }
+                if let e = importError {
+                    Label(e, systemImage: "exclamationmark.triangle.fill").font(.caption.weight(.semibold)).foregroundStyle(Theme.danger)
+                }
+                Text("Or drop pairingFile.plist into the Mirage Go folder (Files app or Apple Devices file sharing); it is picked up automatically.").font(.footnote).lineSpacing(2).foregroundStyle(Theme.dim)
+            }
+            sep
+            linkRow("Developer image", ready.ddiFiles ? (engine.ddiStatus == "mounted" ? "Mounted" : "Ready") : "Not downloaded", ok: ready.ddiFiles) {
+                Button(busy.isEmpty ? "Download (16 MB)" : busy) { downloadImage(fresh: false) }.disabled(!busy.isEmpty)
+                if let e = downloadError {
+                    Label(e, systemImage: "exclamationmark.triangle.fill").font(.caption.weight(.semibold)).foregroundStyle(Theme.danger)
+                }
+            }
+            sep
+            linkRow("Background location", authText, ok: ready.locationAuth == .authorizedAlways) {
+                if ready.locationAuth == .authorizedWhenInUse {
+                    // The one-shot "Always" upgrade prompt is asked here, in the foreground with nothing
+                    // pending, so no app switch can dismiss it (it used to be burned inside Connect).
+                    Button("Allow Always") { LocationKeeper.shared.requestAlwaysUpgrade() }
+                } else if ready.locationAuth != .notDetermined {
+                    // Before the first request the app is not listed in iOS Settings > Location, so there is nothing to open.
+                    Button("Open iOS Settings") { if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) } }
+                }
+                if ready.locationAuth != .notDetermined {
+                    Text("Set Location to Always so the spoof keeps running when the phone is locked.").font(.footnote).lineSpacing(2).foregroundStyle(Theme.dim)
+                }
+            }
+            if ready.vpnUp && ready.pairing && ready.ddiFiles {
+                HStack(spacing: 8) {
+                    Button("Open VPN") { VPNHelper.open() }
+                    Button(busy.isEmpty ? "Re-download image" : busy) { downloadImage(fresh: true) }.disabled(!busy.isEmpty)
+                }
+                .buttonStyle(RowAction())
+            }
+        }
+        .animation(.easeOut(duration: 0.2), value: importError == nil)
+        .animation(.easeOut(duration: 0.2), value: downloadError == nil)
+        .animation(.easeOut(duration: 0.2), value: ready.locationAuth)
+    }
+
+    /// `fresh` deletes the three files first so the download really re-fetches them.
+    func downloadImage(fresh: Bool) {
+        Task {
+            busy = "Downloading…"; downloadError = nil
+            if fresh { DDIStore.removeAll() }
+            do { try await DDIStore.download { s in busy = s } } catch { downloadError = error.localizedDescription }
+            try? await Task.sleep(for: .seconds(1)); busy = ""; ready.refresh()
+        }
+    }
+
+    var advanced: some View {
+        group("Advanced") {
+            HStack {
+                Text("Device IP").font(.subheadline); Spacer()
+                field("10.7.0.1", text: $ipText, kind: .ip)
+            }
+            // The value reverts on blur, so the error is only meaningful while the field is focused.
+            if focus == .ip && !isIPv4(ipText) { Text("Not a valid IPv4 address").font(.caption).foregroundStyle(Theme.danger) }
+            HStack {
+                Text("Port").font(.subheadline); Spacer()
+                field("49152", text: $portText, kind: .port)
+            }
+            if focus == .port && Int(portText).map({ $0 > 0 && $0 < 65536 }) != true { Text("Port must be 1–65535").font(.caption).foregroundStyle(Theme.danger) }
+            Button("Reset to defaults") {
+                settings.deviceIP = "10.7.0.1"; settings.devicePort = 49152
+                ipText = settings.deviceIP; portText = String(settings.devicePort); focus = nil
+            }
+            .buttonStyle(RowAction())
+            Text("Leave these unless LocalDev VPN shows a different address.").font(.footnote).lineSpacing(2).foregroundStyle(Theme.dim)
+        }
+    }
+
+    /// A field that looks like one (card2 well, hairline, white ring while focused) so it is not mistaken for a status row.
+    func field(_ placeholder: String, text: Binding<String>, kind: Field) -> some View {
+        TextField(placeholder, text: text).multilineTextAlignment(.trailing).keyboardType(kind == .ip ? .decimalPad : .numberPad)
+            .font(.subheadline.monospacedDigit()).foregroundStyle(.white)
+            .padding(.horizontal, 10).padding(.vertical, 7).frame(width: 150)
+            .background(Theme.card2)
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(focus == kind ? Color.white.opacity(0.5) : Theme.line, lineWidth: 1))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .focused($focus, equals: kind)
+    }
+
+    /// One line (latest entry, count, chevron) that expands to the scrolling log; keeps the nested scroll off the page by default.
+    var logGroup: some View {
+        group("Log") {
+            Button { withAnimation(.easeOut(duration: 0.2)) { showLog.toggle() } } label: {
+                HStack(spacing: 8) {
+                    Text(log.lines.last ?? "Nothing yet").font(.system(size: 11, design: .monospaced)).foregroundStyle(Theme.muted).lineLimit(1)
+                    Spacer(minLength: 8)
+                    Text("\(log.lines.count)").font(.caption.monospacedDigit()).foregroundStyle(Theme.dim)
+                    Image(systemName: "chevron.right").font(.caption.weight(.bold)).foregroundStyle(Theme.dim)
+                        .rotationEffect(.degrees(showLog ? 90 : 0))
+                }
+                .frame(minHeight: 28).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(showLog ? "Hide log" : "Show log")
+            if showLog {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(Array(log.lines.suffix(80).enumerated()), id: \.offset) { _, l in
+                                Text(l).font(.system(size: 11, design: .monospaced)).foregroundStyle(l.contains("failed") || l.contains("lost") ? Theme.danger : Theme.muted)
+                            }
+                            Color.clear.frame(height: 1).id("end")
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(height: 200)
+                    .onAppear { proxy.scrollTo("end", anchor: .bottom) }
+                    .onChange(of: log.lines.count) { _, _ in proxy.scrollTo("end", anchor: .bottom) }
+                }
+                Button(copied ? "Copied" : "Copy log") {
+                    UIPasteboard.general.string = log.lines.joined(separator: "\n")
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                    copied = true
+                    Task { try? await Task.sleep(for: .seconds(1.5)); copied = false }
+                }
+                .buttonStyle(RowAction())
+            }
+        }
+    }
+
+    var about: some View {
+        group("About") {
+            kvRow("Version", Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—")
+            Text("Only changes what this iPhone reports. It uses Apple's developer location service through LocalDev VPN; nothing is jailbroken and nothing leaves the phone.").font(.footnote).lineSpacing(2).foregroundStyle(Theme.dim)
+        }
+    }
+
     var authText: String {
         switch ready.locationAuth {
         case .authorizedAlways: return "Always"
-        case .authorizedWhenInUse: return "While using (set to Always)"
+        case .authorizedWhenInUse: return "While using"
         case .denied, .restricted: return "Denied"
         default: return "Asked on first Connect"
         }
     }
-    var authColor: Color { ready.locationAuth == .authorizedAlways ? Theme.ok : Theme.warn }
 
-    func group<Content: View>(_ title: String, @ViewBuilder _ content: () -> Content) -> some View {
+    // MARK: building blocks
+
+    /// Header-cased title, optional trailing action (Home's "All places ›" pattern), one Card of rows.
+    func group<Content: View>(_ title: String, action: (String, () -> Void)? = nil, @ViewBuilder _ content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(title.uppercased()).font(.caption.weight(.semibold)).foregroundStyle(Theme.header).padding(.horizontal, 30)
+            HStack {
+                Text(title.uppercased()).font(.caption.weight(.semibold)).foregroundStyle(Theme.header)
+                Spacer()
+                if let a = action {
+                    Button(action: a.1) {
+                        HStack(spacing: 3) {
+                            Text(a.0)
+                            Image(systemName: "chevron.right").font(.caption2.weight(.bold))
+                        }
+                        .font(.caption.weight(.semibold)).foregroundStyle(Theme.muted)
+                    }
+                }
+            }
+            .padding(.horizontal, 30)
             Card { VStack(alignment: .leading, spacing: 10) { content() } }.padding(.horizontal, 16)
         }
     }
+
+    /// Hairline between row pairs inside a group.
+    var sep: some View { Divider().overlay(Theme.line) }
 
     func toggleRow(_ title: String, _ desc: String, isOn: Binding<Bool>) -> some View {
         Toggle(isOn: isOn) {
             VStack(alignment: .leading, spacing: 2) { Text(title).font(.subheadline.weight(.semibold)); Text(desc).font(.caption).foregroundStyle(Theme.muted) }
         }
-        .tint(Color(white: 0.8))
+        .tint(Color(white: 0.7))
     }
 
-    func statusRow(_ k: String, _ v: String, _ c: Color) -> some View {
-        HStack(spacing: 8) { Text(k).font(.subheadline); Spacer(); StatusDot(color: c); Text(v).font(.subheadline).foregroundStyle(c == Theme.muted ? Theme.muted : .white).multilineTextAlignment(.trailing) }
+    /// Title · dot · value on one line; the single fix action only while the row is not green.
+    func linkRow<A: View>(_ k: String, _ v: String, ok: Bool, @ViewBuilder fix: () -> A) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                Text(k).font(.subheadline)
+                Spacer(minLength: 12)
+                StatusDot(color: ok ? Theme.ok : Theme.warn).padding(.top, 6)
+                Text(v).font(.subheadline).foregroundStyle(.white).multilineTextAlignment(.trailing).layoutPriority(1)
+            }
+            if !ok { fix().buttonStyle(Button3D(dark: true, compact: true)) }
+        }
+    }
+
+    /// Plain key/value (no status dot) for facts that are not a state.
+    func kvRow(_ k: String, _ v: String) -> some View {
+        HStack { Text(k).font(.subheadline); Spacer(); Text(v).font(.subheadline.monospacedDigit()).foregroundStyle(Theme.muted) }
     }
 }
 
@@ -1222,64 +1445,55 @@ struct SetupView: View {
     @EnvironmentObject var engine: SpoofEngine
     @EnvironmentObject var ready: Readiness
     @Environment(\.dismiss) private var dismiss
+    /// True when presented as the first-launch full-screen cover (later opens are a sheet).
+    var firstRun = false
     @State private var importing = false
     @State private var importError: String?
-    @State private var importOK = false
     @State private var busy = ""
     @State private var downloadError: String?
     @AppStorage("devModeConfirmed") private var devMode = false
+
+    /// Step order on the page: Developer Mode, LocalDev VPN, Pairing file, Developer image.
+    var done: [Bool] { [devMode, ready.vpnInstalled, ready.pairing, ready.ddiFiles] }
+    var doneCount: Int { done.filter { $0 }.count }
+    /// The developer image is fetched by Connect itself, so it does not gate "Done".
+    var setupDone: Bool { devMode && ready.vpnInstalled && ready.pairing }
+    /// The first open step gets the white button; the rest stay dark.
+    var nextOpen: Int? { done.firstIndex(of: false) }
 
     var body: some View {
         NavigationStack {
             ScrollView(showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 14) {
-                    Text("Four things, once. After that it's just Connect.").font(.footnote).foregroundStyle(Theme.muted).padding(.horizontal, 4)
-                    step(1, "LocalDev VPN", ready.vpnUp ? "Connected" : ready.vpnInstalled ? "Installed. Open it and tap Connect." : "Free app on the App Store. Open it, tap Connect, and tap Allow when the phone asks about a VPN.",
-                         ok: ready.vpnUp, partial: ready.vpnInstalled) {
-                        Button(ready.vpnInstalled ? "Open LocalDev VPN" : "Get LocalDev VPN") {
-                            if ready.vpnInstalled { VPNHelper.open() } else { VPNHelper.openStore() }
-                        }
-                    }
-                    step(2, "Pairing file",
-                         ready.pairing ? "Imported (\(ready.pairingKind))"
-                            : ready.pairingKind == "none" ? "A small file made on the PC while the phone is plugged in. It is usually already on the phone when you get the app. If this isn't green, ask for pairingFile.plist and tap Import."
-                            : "This file is the USB kind and won't work. Ask for a new Remote pairing file from the PC and import that one.",
-                         ok: ready.pairing, partial: false, error: importError, success: importOK ? "Pairing file imported" : nil) {
-                        Button("Import pairing file…") { importing = true }
-                    }
-                    step(3, "Developer image", ready.ddiFiles ? "Downloaded. The first Connect needs internet to finish this step." : "16 MB download. Mirage Go grabs it on the first Connect, or now.",
-                         ok: ready.ddiFiles, partial: false, error: downloadError) {
-                        Button(busy.isEmpty ? "Download now" : busy) {
-                            Task {
-                                busy = "Downloading…"; downloadError = nil
-                                do { try await DDIStore.download { s in busy = s } } catch { downloadError = error.localizedDescription }
-                                try? await Task.sleep(for: .seconds(1)); busy = ""; ready.refresh()
-                            }
-                        }.disabled(!busy.isEmpty)
-                    }
-                    step(4, "Developer Mode", devMode ? "On" : "Settings → Privacy & Security → Developer Mode → On, then restart the phone. Mirage Go cannot check this for you.",
-                         ok: devMode, partial: false) {
-                        Button("I turned it on") { devMode = true }
-                    }
-                    Card {
-                        HStack(alignment: .top, spacing: 10) {
-                            Image(systemName: "wifi").foregroundStyle(Theme.warn)
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text("Do the first Connect on Wi-Fi").font(.subheadline.weight(.semibold))
-                                Text("Tap Allow when the phone asks about the local network and choose Always for location. No Wi-Fi later? Airplane Mode on → LocalDev VPN Connect → Mirage Go Connect → cellular back on (leave Airplane Mode on).").font(.footnote).lineSpacing(2).foregroundStyle(Theme.muted)
-                            }
-                        }
-                    }
-                    // Must not read as "finished" while steps are still open.
-                    Button(ready.allGood ? "Done — go Connect" : "Close for now") { UserDefaults.standard.set(true, forKey: "setupSeen"); dismiss() }
-                        .buttonStyle(Button3D(dark: !ready.allGood)).padding(.top, 4)
+                    header
+                    wifiTip
+                    devModeStep
+                    vpnStep
+                    pairingStep
+                    ddiStep
                 }
                 .padding(16)
             }
             .background(Theme.bg.ignoresSafeArea())
-            .navigationTitle("Setup")
+            // Pinned like Home's PrimaryActionBar, so it is never below the fold.
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                Button(setupDone ? "Done — go Connect" : "Close for now") { dismiss() }
+                    .buttonStyle(Button3D(dark: !setupDone))
+                    .padding(.horizontal, 16).padding(.top, 12).padding(.bottom, 8)
+                    .background(
+                        LinearGradient(colors: [Theme.bg.opacity(0), Theme.bg], startPoint: .top, endPoint: .bottom)
+                            .padding(.top, -24).ignoresSafeArea().allowsHitTesting(false)
+                    )
+            }
+            .toolbarBackground(Theme.bg, for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
+            .toolbarColorScheme(.dark, for: .navigationBar)
+            .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Close") { UserDefaults.standard.set(true, forKey: "setupSeen"); dismiss() }.foregroundStyle(.white) } }
+            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Close") { dismiss() }.foregroundStyle(.white) } }
+            .onChange(of: doneCount) { old, new in
+                if new > old { UINotificationFeedbackGenerator().notificationOccurred(.success) }
+            }
             .fileImporter(isPresented: $importing, allowedContentTypes: [.propertyList, .data, .item], allowsMultipleSelection: false) { result in
                 if case .success(let urls) = result, let u = urls.first {
                     let ok = u.startAccessingSecurityScopedResource()
@@ -1287,11 +1501,10 @@ struct SetupView: View {
                     do {
                         try PairingStore.install(from: u)
                         AppLog.shared.add("pairing file imported")
-                        importError = nil; importOK = true
-                        Task { try? await Task.sleep(for: .seconds(2)); importOK = false }
+                        importError = nil
                     } catch {
                         AppLog.shared.add("import failed: \(error.localizedDescription)")
-                        importError = error.localizedDescription; importOK = false
+                        importError = error.localizedDescription
                     }
                     ready.refresh()
                 }
@@ -1300,23 +1513,94 @@ struct SetupView: View {
         .preferredColorScheme(.dark)
     }
 
-    func step<A: View>(_ n: Int, _ title: String, _ desc: String, ok: Bool, partial: Bool, error: String? = nil, success: String? = nil, @ViewBuilder action: () -> A) -> some View {
+    // MARK: pieces
+
+    var header: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Image("Logo").resizable().scaledToFit().frame(width: 44, height: 44)
+            Text("Set up Mirage Go").font(.system(size: 28, weight: .bold, design: .rounded))
+            Text(doneCount == 4 ? "All set. Close this and press Connect." : setupDone ? "Ready. The image downloads itself on the first Connect." : "\(doneCount) of 4 done · once, then it's just Connect")
+                .font(.footnote).foregroundStyle(Theme.muted).contentTransition(.numericText())
+            HStack(spacing: 6) {
+                ForEach(0..<4, id: \.self) { i in Capsule().fill(done[i] ? Theme.ok : Theme.card2).frame(height: 4) }
+            }
+            .animation(.easeOut(duration: 0.3), value: doneCount)
+        }
+        .padding(.horizontal, 4).padding(.bottom, 2)
+    }
+
+    var wifiTip: some View {
+        Card {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "wifi").foregroundStyle(Theme.warn)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Do the first Connect on Wi-Fi").font(.subheadline.weight(.semibold))
+                    Text("iOS will ask twice: tap Allow for the local network, and choose Always for location.").font(.footnote).lineSpacing(2).foregroundStyle(Theme.muted)
+                }
+            }
+        }
+    }
+
+    var devModeStep: some View {
+        step(1, "Developer Mode",
+             devMode ? "On" : "Settings → Privacy & Security → Developer Mode → On. The phone restarts once. Do this first — nothing below works without it.",
+             ok: devMode, primary: nextOpen == 0) {
+            Button("I turned it on") { devMode = true }
+        }
+    }
+
+    /// Setup is about *installed*; Connect turns the tunnel on itself, so this step must not flip with it.
+    var vpnStep: some View {
+        step(2, "LocalDev VPN",
+             !ready.vpnInstalled ? "Free app on the App Store. Install it, open it once, and tap Allow when iOS asks about a VPN."
+                : ready.vpnUp ? "Installed and connected." : "Installed. Mirage Go turns it on for you when you press Connect.",
+             ok: ready.vpnInstalled, primary: nextOpen == 1) {
+            Button("Get LocalDev VPN") { VPNHelper.openStore() }
+        }
+    }
+
+    var pairingStep: some View {
+        step(3, "Pairing file",
+             ready.pairing ? "Imported."
+                : ready.pairingKind == "none" ? "Made on the PC while the phone is plugged in. It is usually pushed to the phone for you — if this isn't green yet, ask for pairingFile.plist and tap Import."
+                : "This is the USB kind and won't work. Ask the PC for a new Remote pairing file and import that one.",
+             ok: ready.pairing, primary: nextOpen == 2, error: importError) {
+            Button("Import pairing file…") { importing = true }
+        }
+    }
+
+    var ddiStep: some View {
+        step(4, "Developer image (automatic)",
+             ready.ddiFiles ? "Downloaded." : "16 MB. Mirage Go fetches it on the first Connect; download now to make that Connect faster.",
+             ok: ready.ddiFiles, primary: false, error: downloadError) {
+            Button(busy.isEmpty ? "Download now" : busy) {
+                Task {
+                    busy = "Downloading…"; downloadError = nil
+                    do { try await DDIStore.download { s in busy = s } } catch { downloadError = error.localizedDescription }
+                    try? await Task.sleep(for: .seconds(1)); busy = ""; ready.refresh()
+                }
+            }
+            .disabled(!busy.isEmpty)
+        }
+    }
+
+    func step<A: View>(_ n: Int, _ title: String, _ desc: String, ok: Bool, primary: Bool, error: String? = nil, @ViewBuilder action: () -> A) -> some View {
         Card {
             HStack(alignment: .top, spacing: 12) {
                 ZStack {
-                    Circle().fill(ok ? Theme.ok : partial ? Theme.warn : Theme.card2).frame(width: 30, height: 30)
-                    if ok { Image(systemName: "checkmark").font(.system(size: 13, weight: .bold)).foregroundStyle(.black) } else { Text("\(n)").font(.system(size: 13, weight: .bold)).foregroundStyle(partial ? .black : .white) }
+                    Circle().fill(ok ? Theme.ok : Theme.card2)
+                        .overlay(Circle().stroke(ok ? .clear : Theme.line, lineWidth: 1))
+                        .frame(width: 30, height: 30)
+                    if ok { Image(systemName: "checkmark").font(.system(size: 13, weight: .bold)).foregroundStyle(.black) } else { Text("\(n)").font(.system(size: 13, weight: .bold)).foregroundStyle(.white) }
                 }
+                .animation(.easeOut(duration: 0.25), value: ok)
                 VStack(alignment: .leading, spacing: 6) {
                     Text(title).font(.headline)
                     Text(desc).font(.footnote).lineSpacing(2).foregroundStyle(Theme.muted)
                     if let e = error {
                         Label(e, systemImage: "exclamationmark.triangle.fill").font(.caption.weight(.semibold)).foregroundStyle(Theme.danger)
                     }
-                    if let s = success {
-                        Label(s, systemImage: "checkmark.circle.fill").font(.caption.weight(.semibold)).foregroundStyle(Theme.ok)
-                    }
-                    if !ok { action().buttonStyle(Button3D(dark: true, compact: true)).padding(.top, 4) }
+                    if !ok { action().buttonStyle(Button3D(dark: !primary, compact: true)).padding(.top, 4) }
                 }
             }
         }
