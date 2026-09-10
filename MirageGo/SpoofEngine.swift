@@ -228,7 +228,7 @@ final class SpoofEngine: ObservableObject {
                 // cannot toggle another app's VPN, so take the user straight there instead of making them hunt for it.
                 if refused, VPNHelper.installed {
                     AppLog.shared.add("tunnel refused; opening LocalDev VPN for a bounce")
-                    VPNHelper.open()
+                    VPNHelper.openPlain()
                 }
                 return
             }

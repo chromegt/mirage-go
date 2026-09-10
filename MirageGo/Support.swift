@@ -163,6 +163,13 @@ enum VPNHelper {
         UIApplication.shared.open(u)
     }
 
+    /// Just bring LocalDev VPN to the front (no enable action, so it does not bounce straight back here): used when
+    /// the user has to tap Disconnect / Connect there by hand.
+    static func openPlain() {
+        guard let u = URL(string: "localdevvpn://") else { return }
+        UIApplication.shared.open(u)
+    }
+
     /// The loopback VPN gives the phone a 10.7.x.x interface while it is up.
     static var tunnelUp: Bool {
         var first: UnsafeMutablePointer<ifaddrs>?
