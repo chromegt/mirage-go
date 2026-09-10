@@ -56,12 +56,13 @@ final class Fleet: ObservableObject {
 
     // MARK: lifecycle
 
-    /// Called once from the root view: immediate check-in, a 60 s repeat, and one (debounced) per engine phase change.
+    /// Called once from the root view: immediate check-in, a 20 s repeat, and one (debounced) per engine phase change.
     func start(engine: SpoofEngine) {
         self.engine = engine
         guard !started else { return }
         started = true
-        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+        // 20 s so an admin switch-off drops the spoof within about that long (the request is a few hundred bytes).
+        timer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.checkIn() }
         }
         engine.$phase
