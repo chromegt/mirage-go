@@ -326,6 +326,9 @@ final class AppSettings: ObservableObject {
     @Published var lastName: String { didSet { UserDefaults.standard.set(lastName, forKey: "lastName") } }
     /// Off = the greyscale world (default); on = Apple's satellite colours.
     @Published var colourMap: Bool { didSet { UserDefaults.standard.set(colourMap, forKey: "colourMap") } }
+    /// What the admin list shows for this phone. Empty until the user picks one: an empty name is never sent, so a
+    /// name the admin set from the fleet panel is not overwritten at the next check-in.
+    @Published var nickname: String { didSet { UserDefaults.standard.set(nickname, forKey: "nickname") } }
 
     static let speeds: [(id: String, label: String, mps: Double)] = [("walk", "Walk", 1.4), ("jog", "Jog", 3.0), ("bike", "Bike", 5.5), ("drive", "Drive", 13.4)]
     var speedMps: Double { Self.speeds.first { $0.id == travelSpeed }?.mps ?? 13.4 }
@@ -342,5 +345,6 @@ final class AppSettings: ObservableObject {
         lastLon = d.object(forKey: "lastLon") as? Double ?? -155.42837
         lastName = d.string(forKey: "lastName") ?? "Hawaii"
         colourMap = d.bool(forKey: "colourMap")
+        nickname = d.string(forKey: "nickname") ?? ""
     }
 }

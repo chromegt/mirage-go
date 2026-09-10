@@ -254,6 +254,7 @@ struct PlaceKey: Equatable {
 struct PrimaryActionBar: View {
     @EnvironmentObject var engine: SpoofEngine
     @EnvironmentObject var ready: Readiness
+    @ObservedObject var fleet = Fleet.shared
     @Binding var showSetup: Bool
     @Binding var tab: Int
 
@@ -274,19 +275,27 @@ struct PrimaryActionBar: View {
                     } label: { Label("Change place", systemImage: "mappin") }
                     .buttonStyle(Button3D(dark: true))
                     .frame(width: 158)
-                    Button {
-                        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                        switch engine.phase {
-                        case .active: engine.disconnect()
-                        case .connecting: engine.cancelConnect()
-                        case .idle: engine.connect()
+                    if !fleet.enabled && engine.phase == .idle {
+                        // The admin switched this copy off: Connect is replaced by a dead dark button so the reason is on the bar itself.
+                        Button { } label: { Text("Switched off by admin") }
+                            .buttonStyle(Button3D(dark: true))
+                            .disabled(true)
+                            .accessibilityHint(Fleet.offHint)
+                    } else {
+                        Button {
+                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                            switch engine.phase {
+                            case .active: engine.disconnect()
+                            case .connecting: engine.cancelConnect()
+                            case .idle: engine.connect()
+                            }
+                        } label: {
+                            Text(engine.phase == .active ? "Disconnect" : engine.phase == .connecting ? "Cancel" : "Connect")
                         }
-                    } label: {
-                        Text(engine.phase == .active ? "Disconnect" : engine.phase == .connecting ? "Cancel" : "Connect")
+                        // Disconnect is the red action while spoofing; Cancel stays the plain dark one.
+                        .buttonStyle(Button3D(dark: engine.phase != .idle, danger: engine.phase == .active))
+                        .accessibilityHint(engine.phase == .connecting ? "Stops the connection attempt" : "")
                     }
-                    // Disconnect is the red action while spoofing; Cancel stays the plain dark one.
-                    .buttonStyle(Button3D(dark: engine.phase != .idle, danger: engine.phase == .active))
-                    .accessibilityHint(engine.phase == .connecting ? "Stops the connection attempt" : "")
                 }
             }
         }
@@ -362,6 +371,7 @@ struct HomeView: View {
     @EnvironmentObject var ready: Readiness
     @EnvironmentObject var settings: AppSettings
     @ObservedObject var net = NetworkMonitor.shared
+    @ObservedObject var fleet = Fleet.shared
     @Binding var tab: Int
     @Binding var showSetup: Bool
     @Binding var camera: MapCameraPosition
@@ -373,6 +383,8 @@ struct HomeView: View {
 
     /// While the link is being rebuilt the phone shows its REAL location, so that state must not look like "Spoofing".
     var statusColor: Color {
+        // Switched off by the admin: the red state wins over everything (the engine is idle by then).
+        if !fleet.enabled { return Theme.danger }
         switch engine.phase {
         case .active: return engine.rebuilding ? Theme.warn : Theme.ok
         case .connecting: return Theme.warn
@@ -382,6 +394,7 @@ struct HomeView: View {
         }
     }
     var statusText: String {
+        if !fleet.enabled { return "Switched off" }
         switch engine.phase {
         case .active: return engine.rebuilding ? "Reconnecting…" : "Spoofing"
         case .connecting: return "Connecting…"
@@ -390,6 +403,7 @@ struct HomeView: View {
     }
     /// Small caps pill copy; the session clock runs while spoofing.
     var pillText: String {
+        if !fleet.enabled { return "SWITCHED OFF" }
         switch engine.phase {
         case .active:
             if engine.rebuilding { return "RECONNECTING" }
@@ -609,6 +623,7 @@ struct HomeView: View {
     }
 
     var subline: String {
+        if !fleet.enabled { return fleet.offText }
         if engine.phase == .active && engine.rebuilding { return "The link dropped — your real location may show until it is back" }
         if engine.phase == .active {
             if let tr = engine.travel { return "On the way · \(Geo.fmtDist(max(0, tr.dist * (1 - engine.travelProgress)))) to go" }
@@ -1076,13 +1091,21 @@ struct RowAction: ButtonStyle {
 }
 
 struct SettingsView: View {
-    enum Field: Hashable { case ip, port }
+    enum Field: Hashable { case ip, port, nick, admin }
 
     @EnvironmentObject var engine: SpoofEngine
     @EnvironmentObject var settings: AppSettings
     @EnvironmentObject var ready: Readiness
     @ObservedObject var log = AppLog.shared
+    @ObservedObject var fleet = Fleet.shared
     @Binding var showSetup: Bool
+    @State private var nickText = AppSettings.shared.nickname
+    /// Admin password lives only in this view's state; it is never written anywhere.
+    @State private var adminPW = ""
+    @State private var adminWrong = false
+    @State private var showAdmin = false
+    /// Drives the "Check-in … ago" line; a slow tick is enough for that.
+    @State private var now = Date()
     @State private var importing = false
     @State private var importError: String?
     @State private var busy = ""
@@ -1102,17 +1125,34 @@ struct SettingsView: View {
                     Text("How the phone moves, and whether it is ready.").font(.footnote).foregroundStyle(Theme.muted)
                 }
                 .padding(.horizontal, 20).padding(.top, 24)   // clears the TopScrim so the title is never under it at rest
-                mapGroup
-                movement
-                phoneLink
-                advanced
-                logGroup
-                about
+                Group {
+                    mapGroup
+                    thisPhone
+                    movement
+                    phoneLink
+                }
+                Group {
+                    advanced
+                    logGroup
+                    about
+                    admin
+                }
                 Color.clear.frame(height: 8)
             }
         }
         .overlay(alignment: .top) { TopScrim() }
         .scrollDismissesKeyboard(.interactively)
+        .task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(5))
+                now = Date()
+            }
+        }
+        .sheet(isPresented: $showAdmin) {
+            AdminView(pw: adminPW)
+                .presentationBackground(Theme.bg)
+                .presentationDragIndicator(.visible)
+        }
         .toolbar {
             ToolbarItemGroup(placement: .keyboard) {
                 Spacer()
@@ -1127,7 +1167,10 @@ struct SettingsView: View {
             if f != .port {
                 if let p = Int(portText), p > 0, p < 65536 { settings.devicePort = p } else { portText = String(settings.devicePort) }
             }
+            if f != .nick { commitNick() }
         }
+        // An admin rename of this phone (AdminView) lands in the store; mirror it unless the field is being edited.
+        .onChange(of: settings.nickname) { _, n in if focus != .nick { nickText = n } }
         .fileImporter(isPresented: $importing, allowedContentTypes: [.propertyList, .data, .item], allowsMultipleSelection: false) { result in
             switch result {
             case .success(let urls):
@@ -1155,6 +1198,40 @@ struct SettingsView: View {
         group("Map") {
             toggleRow("Colour map", "Apple's satellite colours instead of the black & white world.", isOn: $settings.colourMap)
         }
+    }
+
+    /// What the admin list shows for this phone, and when it last reported in.
+    var thisPhone: some View {
+        group("This phone") {
+            HStack {
+                Text("Nickname").font(.subheadline); Spacer()
+                // Placeholder only: the phone's own name is never sent, so an admin rename sticks.
+                field(UIDevice.current.name, text: $nickText, kind: .nick)
+            }
+            kvRow("Check-in", checkInText)
+            Text("The nickname is what the admin list shows for this phone. It checks in once a minute; nothing about your real location is sent.").font(.footnote).lineSpacing(2).foregroundStyle(Theme.dim)
+        }
+    }
+
+    var checkInText: String {
+        var s: String
+        if let t = fleet.lastCheckIn {
+            let ago = Int(max(0, now.timeIntervalSince(t)))
+            s = ago < 10 ? "Just now" : ago < 60 ? "\(ago) s ago" : ago < 3600 ? "\(ago / 60) min ago" : "\(ago / 3600) h ago"
+        } else {
+            s = "Never"
+        }
+        if !fleet.reachable { s += " · offline" }
+        return s
+    }
+
+    /// Nickname commits on blur/submit like the IP field; an empty field means "unset" (the admin list keeps its name).
+    func commitNick() {
+        let n = nickText.trimmingCharacters(in: .whitespaces)
+        nickText = n
+        guard n != settings.nickname else { return }
+        settings.nickname = n
+        Task { await Fleet.shared.checkIn() }   // the admin list picks the new name up right away
     }
 
     var movement: some View {
@@ -1282,13 +1359,55 @@ struct SettingsView: View {
 
     /// A field that looks like one (card2 well, hairline, white ring while focused) so it is not mistaken for a status row.
     func field(_ placeholder: String, text: Binding<String>, kind: Field) -> some View {
-        TextField(placeholder, text: text).multilineTextAlignment(.trailing).keyboardType(kind == .ip ? .decimalPad : .numberPad)
+        TextField(placeholder, text: text).multilineTextAlignment(.trailing)
+            .keyboardType(kind == .ip ? .decimalPad : kind == .port ? .numberPad : .default)
+            .autocorrectionDisabled(kind != .nick)
+            .submitLabel(.done)
+            .onSubmit { focus = nil }
             .font(.subheadline.monospacedDigit()).foregroundStyle(.white)
             .padding(.horizontal, 10).padding(.vertical, 7).frame(width: 150)
             .background(Theme.card2)
             .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(focus == kind ? Color.white.opacity(0.5) : Theme.line, lineWidth: 1))
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             .focused($focus, equals: kind)
+    }
+
+    /// Admin password entry (same well as `field`, but a SecureField and full width).
+    var adminField: some View {
+        SecureField("Admin password", text: $adminPW)
+            .keyboardType(.numberPad).submitLabel(.go)
+            .onSubmit { openAdmin() }
+            .font(.subheadline.monospacedDigit()).foregroundStyle(.white)
+            .padding(.horizontal, 10).padding(.vertical, 9)
+            .background(Theme.card2)
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(focus == .admin ? Color.white.opacity(0.5) : Theme.line, lineWidth: 1))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .focused($focus, equals: .admin)
+    }
+
+    /// Fleet panel behind a password. The password is only ever compared here and handed to the sheet.
+    var admin: some View {
+        group("Admin") {
+            adminField
+            if adminWrong { Text("Wrong password").font(.caption).foregroundStyle(Theme.danger) }
+            Button("Open admin panel") { openAdmin() }
+                .buttonStyle(Button3D(dark: true, compact: true))
+                .disabled(adminPW.isEmpty)
+            Text("Lists every phone running Mirage Go, where it is, and lets the admin switch one off.").font(.footnote).lineSpacing(2).foregroundStyle(Theme.dim)
+        }
+        .animation(.easeOut(duration: 0.2), value: adminWrong)
+    }
+
+    func openAdmin() {
+        focus = nil
+        if adminPW == "3843" {
+            adminWrong = false
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            showAdmin = true
+        } else {
+            adminWrong = true
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+        }
     }
 
     /// One line (latest entry, count, chevron) that expands to the scrolling log; keeps the nested scroll off the page by default.

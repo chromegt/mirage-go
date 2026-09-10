@@ -90,6 +90,13 @@ final class SpoofEngine: ObservableObject {
 
     func connect() {
         guard phase == .idle else { return }
+        // The admin can switch a copy off from the fleet panel; the phone then refuses to start (phase stays idle).
+        guard Fleet.shared.enabled else {
+            error = Fleet.shared.offText
+            hint = Fleet.offHint
+            AppLog.shared.add("connect refused: switched off by the admin")
+            return
+        }
         stopping = false
         error = nil; hint = nil
         connectedAt = nil

@@ -20,6 +20,8 @@ struct MirageGoApp: App {
                 .environmentObject(PlaceStore.shared)
                 .environmentObject(Readiness.shared)
                 .preferredColorScheme(.dark)
+                // Fleet check-in: once now, every 60 s, and on phase changes (start() is idempotent).
+                .onAppear { Fleet.shared.start(engine: engine) }
                 .onOpenURL { url in
                     // A plist arrives via "Open in"; miragego:// is LocalDev VPN's callback after it connects (not a file).
                     if url.isFileURL {
@@ -40,6 +42,7 @@ struct MirageGoApp: App {
                 PairingStore.adoptFromDocuments()
                 Readiness.shared.refresh()
                 engine.onForeground()
+                Fleet.shared.onForeground()
             }
         }
     }
