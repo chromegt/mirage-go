@@ -222,7 +222,14 @@ final class SpoofEngine: ObservableObject {
                     if aborted { return }
                     continue
                 }
+                let refused = isRefused(error)
                 fail("Tunnel failed: \(error.localizedDescription)", hint: tunnelHint(for: error))
+                // A refused loopback after a previous session needs LocalDev VPN bounced (Disconnect, Connect); apps
+                // cannot toggle another app's VPN, so take the user straight there instead of making them hunt for it.
+                if refused, VPNHelper.installed {
+                    AppLog.shared.add("tunnel refused; opening LocalDev VPN for a bounce")
+                    VPNHelper.open()
+                }
                 return
             }
         }
@@ -332,14 +339,19 @@ final class SpoofEngine: ObservableObject {
         if position.latitude != target.latitude || position.longitude != target.longitude { send() }
     }
 
+    /// TCP-level refusals/resets on 10.7.0.1: the VPN's inside-the-phone forwarding stopped answering.
+    private func isRefused(_ error: Error) -> Bool {
+        let t = error.localizedDescription.lowercased()
+        return t.contains("refused") || t.contains("reset") || t.contains("broken pipe")
+    }
+
     private func tunnelHint(for error: Error) -> String {
         let e = error as? FFIError
         if e?.code == -9 { return "The pairing file could not be read. Ask for a new Remote pairing file from the PC and import it again." }
         if e?.isPairingRejected == true { return "The phone no longer accepts this pairing file. Plug the phone into the PC once so a new Remote pairing file can be made, then import it." }
         if !VPNHelper.tunnelUp { return "LocalDev VPN dropped. Open it, tap Connect, then try again." }
-        let text = error.localizedDescription.lowercased()
-        if text.contains("refused") || text.contains("reset") || text.contains("broken pipe") {
-            return "The link inside the phone stopped answering (this happens after a session ends). Open LocalDev VPN, tap Disconnect, then Connect, and press Connect here again. Still stuck? Airplane Mode on for 5 seconds, then off, and try again; last resort is restarting the phone."
+        if isRefused(error) {
+            return "The link inside the phone stopped answering (this happens after a session ends). In LocalDev VPN tap Disconnect, then Connect, then come back and press Connect. Still stuck? Airplane Mode on for 5 seconds, then off, and try again; last resort is restarting the phone."
         }
         return "Check Developer Mode is on (Settings → Privacy & Security). If iOS asked to allow local network access, tap Allow and press Connect again. Otherwise re-make the pairing file on the PC (plug in once) and import it again; if you are on cellular and it keeps failing, try Airplane Mode on → LocalDev VPN → Connect → Airplane Mode off."
     }
