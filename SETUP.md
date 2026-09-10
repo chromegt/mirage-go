@@ -42,7 +42,7 @@ If something fails, the red card says what to do; Settings → Log → Copy log 
 
 - Open **Mirage Go → Connect** (it opens LocalDev VPN for you when needed).
 - The first Connect after a reboot needs internet again (Apple re-signs the developer image). Wi-Fi is easiest.
-- Cellular only: Airplane Mode on → LocalDev VPN Connect → Mirage Go Connect → cellular back on, Airplane Mode stays on.
+- Cellular works without tricks (tested). If Connect ever fails without Wi-Fi: Airplane Mode on → LocalDev VPN Connect → Mirage Go Connect → Airplane Mode off.
 - Home: tap a Quick place, or tap the map to drop a pin → Go here (it names the spot when online). "All places" has
   search, typed coordinates and favourites. Realistic travel glides there, Teleport jumps. The red **Disconnect**
   button is the kill switch: instant real location.

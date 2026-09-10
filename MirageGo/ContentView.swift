@@ -712,8 +712,8 @@ struct HomeView: View {
             HStack(alignment: .top, spacing: 10) {
                 Image(systemName: "airplane").foregroundStyle(Theme.warn)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("On cellular only").font(.subheadline.weight(.semibold))
-                    Text("Turn Airplane Mode on, connect LocalDev VPN, press Connect, then turn cellular back on (leave Airplane Mode on).").font(.footnote).lineSpacing(2).foregroundStyle(Theme.muted)
+                    Text("On cellular").font(.subheadline.weight(.semibold))
+                    Text("Connect normally. If it fails without Wi-Fi: Airplane Mode on → LocalDev VPN Connect → Mirage Go Connect → Airplane Mode off.").font(.footnote).lineSpacing(2).foregroundStyle(Theme.muted)
                 }
             }
         }

@@ -334,7 +334,7 @@ final class SpoofEngine: ObservableObject {
         if e?.code == -9 { return "The pairing file could not be read. Ask for a new Remote pairing file from the PC and import it again." }
         if e?.isPairingRejected == true { return "The phone no longer accepts this pairing file. Plug the phone into the PC once so a new Remote pairing file can be made, then import it." }
         if !VPNHelper.tunnelUp { return "LocalDev VPN dropped. Open it, tap Connect, then try again." }
-        return "Check Developer Mode is on (Settings → Privacy & Security). If iOS asked to allow local network access, tap Allow and press Connect again. Otherwise re-make the pairing file on the PC (plug in once) and import it again; make sure Wi-Fi is on, or Airplane Mode is on when you are on cellular."
+        return "Check Developer Mode is on (Settings → Privacy & Security). If iOS asked to allow local network access, tap Allow and press Connect again. Otherwise re-make the pairing file on the PC (plug in once) and import it again; if you are on cellular and it keeps failing, try Airplane Mode on → LocalDev VPN → Connect → Airplane Mode off."
     }
 
     func disconnect() {
@@ -527,7 +527,7 @@ final class SpoofEngine: ObservableObject {
                 self.phase = .idle
                 self.connectedAt = nil
                 self.steps = []
-                self.error = "Spoof dropped: \(why)"; self.hint = "Check LocalDev VPN is connected (Wi-Fi on, or Airplane Mode on cellular) and press Connect."
+                self.error = "Spoof dropped: \(why)"; self.hint = "Check LocalDev VPN is connected and press Connect (on cellular, Airplane Mode on → connect → off if it keeps failing)."
                 Notify.post("Mirage Go stopped", "The spoof dropped. Open Mirage Go to reconnect.")
             }
         }
